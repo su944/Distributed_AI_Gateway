@@ -37,3 +37,10 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+### Local environment and runtime output ###
+.env
+.env.*
+!.env.example
+*.log
+.idea/

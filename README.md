@@ -4,9 +4,9 @@ A production-oriented gateway providing a consistent API over multiple AI provid
 
 ## Current status
 
-**Scaffold only; all gateway capabilities in this document are planned.** The repository contains a minimal Maven project and an IDE-generated sample `Main` class. There are no Spring Boot dependencies, gateway endpoints, provider integrations, tests, database integration, Redis integration, or deployment files.
+**Phase 1 foundation and Phase 2 unified chat API with a deterministic mock provider are implemented.** The application uses Java 21, Spring Boot 3.5.16, and Maven. It includes capability package documentation, profile/environment configuration, minimal Actuator health, framework error conventions, JUnit 5 unit and HTTP integration tests, a Maven wrapper, CI, and optional application-only Docker execution.
 
-The project baseline is **JDK 26 and Spring Boot**. The current `pom.xml` already targets Java 26. Replacing the sample with a Spring Boot application and verifying the selected framework and build tooling against JDK 26 are phase 1 work. This README does not establish that the application builds or runs successfully.
+`POST /v1/chat/completions`, Bean Validation, provider selection, sanitized Problem Details, and mock enable/disable configuration are implemented. Real providers, model discovery, authentication, tenant management, policy routing, rate limiting, caching, persistence, and durable usage accounting remain planned. No external services or credentials are required.
 
 ## 1. Overview and problem statement
 
@@ -65,15 +65,15 @@ Start with one adapter. Add a second to prove API and routing logic remain indep
 
 | Technology | Intended role | Current state |
 | --- | --- | --- |
-| JDK 26 / Java 26 | Runtime and language baseline | Maven source and target already configured for Java 26; build verification pending |
-| Spring Boot | HTTP API, configuration, injection, operational endpoints | Not configured |
-| Maven | Build and dependency management | Minimal POM exists; no wrapper |
+| Java 21 | Runtime and language baseline | Configured with compiler release 21 |
+| Spring Boot 3.5.16 | HTTP foundation, configuration, injection, health | Implemented; mock chat endpoint available |
+| Maven 3.9.11 | Build and dependency management | Wrapper included |
 | PostgreSQL | Tenants, hashed API keys, model mappings, policies, usage metadata | Not integrated |
 | Redis | Atomic rate counters and expiring response cache | Not integrated |
-| Docker | Application image and local dependency services | No Docker configuration |
-| JUnit 5 and Mockito | Unit and module tests | Not configured |
+| Docker | Optional application container | Dockerfile and application-only Compose included |
+| JUnit 5 and Mockito | Unit and module tests | Available through Boot test starter; unit and HTTP integration tests included |
 
-Framework versions, HTTP client, persistence and migration tools, resilience library, and integration-test tooling remain to be selected. **Ask before introducing any new dependency**, as required by `AGENTS.md`.
+Direct dependencies are the web, validation, Actuator, and test starters plus the existing Prometheus registry. Only health is exposed over HTTP. Provider HTTP client, persistence/migration tools, and resilience tooling remain to be selected. **Ask before introducing any new dependency**, as required by `AGENTS.md`.
 
 ## 6. High-level system architecture
 
@@ -109,7 +109,7 @@ flowchart LR
 - **Persistence:** Repository interfaces and storage implementations.
 - **Observability:** Sanitized usage events, correlation, metrics, and traces.
 
-These are proposed code boundaries, not existing packages or independently deployed services. Domain/application code depends on interfaces implemented by infrastructure adapters. Modules communicate through public contracts rather than accessing implementation details.
+The implemented root is `com.sunny.gateway`, with documented capability packages: `gateway`, `provider`, `routing`, `authentication`, `ratelimit`, `tenant`, `usage`, `config`, and `common`. The gateway API/orchestrator, provider interface/mock adapter, and simple provider selector are implemented; other capability implementations remain planned. These packages are code boundaries within one deployable application. Domain/application code depends on interfaces implemented by infrastructure adapters. Modules communicate through public contracts rather than accessing implementation details.
 
 ### Request flow and failure policy
 
@@ -128,106 +128,80 @@ PostgreSQL is the durable source of truth. Configuration caches need bounded sta
 
 Horizontal scaling adds replicas behind the load balancer. Verify distributed quotas, connection pools, configuration freshness, and provider concurrency across replicas before claiming scale readiness. Service extraction should follow measured needs, not precede them.
 
-## 7. Core API contracts — proposed, not available
+## 7. Core API contracts
 
-The initial JSON contract is inspired by familiar chat APIs but does not promise drop-in compatibility. Finalize contracts with tests before implementation.
+### Implemented: `POST /v1/chat/completions`
 
-### Common conventions
+The Phase 2 API is a small synchronous text-chat contract, not full OpenAI compatibility. It needs no authentication or credentials. It supports only `mock-chat` and returns one assistant choice. `GET /v1/models`, streaming, request correlation headers, real providers, and the broader future contracts remain planned.
 
-- Client endpoints use `/v1` and `Authorization: Bearer <gateway-api-key>`; this is not a vendor key.
-- Responses include `X-Request-ID`; errors include the same ID in their body.
-- Models are configured logical aliases. Clients cannot supply vendor credentials or provider URLs.
-- No initial idempotency guarantee: repeating a POST may cause additional billable work.
-
-### `POST /v1/chat/completions`
-
-Illustrative request:
-
-```json
-{
-  "model": "chat-default",
-  "messages": [{ "role": "user", "content": "Explain consistent hashing briefly." }],
-  "temperature": 0.2,
-  "max_tokens": 256,
-  "stream": false
-}
+```sh
+curl --fail-with-body http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mock-chat","messages":[{"role":"system","content":"Be brief"},{"role":"user","content":"Hello world"}],"temperature":0.2,"max_tokens":256}'
 ```
 
-`model` and a nonempty `messages` array are required. Initial roles are `system`, `user`, and `assistant`, with text-only content. Optional `temperature` must satisfy the model's advertised range; optional `max_tokens` is a positive integer within configured limits. Only omitted or `false` streaming is supported. Unknown fields, unsupported options, and invalid parameters return `400`; oversized bodies return `413`.
-
-Illustrative `200` response:
+Expected HTTP `200` (ID is stable for identical deserialized requests):
 
 ```json
 {
-  "id": "gw_example",
-  "object": "chat.completion",
-  "created": 1791504000,
-  "model": "chat-default",
+  "id": "mock-<deterministic UUID>",
+  "model": "mock-chat",
   "choices": [{
     "index": 0,
-    "message": { "role": "assistant", "content": "Consistent hashing maps keys and nodes onto a ring..." },
+    "message": {"role": "assistant", "content": "Mock response: Hello world"},
     "finish_reason": "stop"
   }],
-  "usage": { "prompt_tokens": 12, "completion_tokens": 18, "total_tokens": 30 },
-  "gateway": { "request_id": "req_example", "cached": false }
+  "usage": {"prompt_tokens": 4, "completion_tokens": 4, "total_tokens": 8}
 }
 ```
 
-Initially return one completion. Normalize finish reasons to `stop`, `length`, `content_filter`, or `unknown`. Unreported token counts are `null`, not invented estimates. Cache hits expose original completion usage with `cached: true`; internal accounting records that no new provider invocation occurred.
+Required fields: a nonblank `model` (maximum 128 characters) and 1–100 messages. Every message must be non-null, use `system`, `user`, or `assistant`, and contain nonblank text up to 32,768 characters. Optional `temperature` is 0–2; the deterministic mock accepts it without changing output. Optional `max_tokens` is 1–4096 (default 4096). `stream` must be omitted, null, or false. Unknown JSON fields are rejected. No HTTP body-byte limit is implemented yet.
 
-### `GET /v1/models`
+The mock prefixes the last user message with `Mock response: `; without a user message it returns `Mock response: No user message.`. It truncates by whitespace-separated words to the output limit and reports `finish_reason: length` when truncated, otherwise `stop`. Usage counts whitespace-separated words across all input messages and the output. These counts are **simulated tokens**, not vendor tokenizer measurements or billable usage. IDs derive from the parsed request; no clock, network, or credentials are involved.
 
-Return only models authorized for the tenant, including capabilities and validation limits. These names and limits are illustrative, not existing configuration.
+### Implemented error contract
+
+All errors use Spring MVC Problem Details (`application/problem+json`). Domain and validation errors add a stable `code`; framework errors retain standard Problem Details fields. Error responses never include submitted message text, provider exception messages, or stack traces.
 
 ```json
 {
-  "object": "list",
-  "data": [{
-    "id": "chat-default",
-    "capabilities": ["text_chat"],
-    "limits": { "max_output_tokens": 4096, "temperature_min": 0, "temperature_max": 1 }
-  }]
+  "type": "about:blank",
+  "title": "Bad Request",
+  "status": 400,
+  "detail": "The requested model is not supported.",
+  "instance": "/v1/chat/completions",
+  "code": "unsupported_model"
 }
 ```
 
-### Error contract
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `400` | `invalid_request` | Invalid messages/options, malformed JSON, or unknown fields |
+| `400` | `unsupported_model` | Model other than `mock-chat` |
+| `503` | `provider_unavailable` | Mock provider disabled |
+| `502` | `provider_error` | Adapter throws a typed provider failure |
+| `500` | `internal_error` | Unexpected failure, with sanitized detail |
 
-```json
-{
-  "error": {
-    "code": "rate_limit_exceeded",
-    "message": "Request limit exceeded.",
-    "request_id": "req_example"
-  }
-}
-```
+The mock does not expose a client-controlled failure trigger. Tests substitute a failing provider to verify error mapping through the controller/service/interface path.
 
-| Status | Meaning |
-| --- | --- |
-| `400` | Invalid request, unknown logical model, or unsupported option |
-| `401` | Missing, invalid, expired, or revoked key |
-| `403` | Tenant lacks model permission |
-| `413` | Body exceeds configured limit |
-| `429` | Gateway rate allowance exhausted; `Retry-After` is in seconds |
-| `502` | Upstream protocol failure or unusable response |
-| `503` | No eligible provider, required dependency unavailable, or capacity exhausted |
-| `504` | Overall execution deadline exceeded |
-| `500` | Unexpected internal failure |
+### Implemented class boundaries
 
-Sanitize all errors; do not forward vendor payloads or credentials. Upstream quota exhaustion maps to provider unavailability (`503`), distinct from gateway rate enforcement (`429`).
+`ChatCompletionController` validates HTTP requests and delegates to `GatewayService`. The service asks `routing.ProviderSelector` for the first registered provider supporting the model, then calls `provider.LLMProvider`. `MockLLMProvider` implements that boundary and is conditionally registered. Request/message/response records define the client contract; `GatewayExceptionHandler` maps gateway, adapter, validation, and parsing failures. No routing policy engine or speculative storage abstractions are introduced.
 
 ### Operational endpoints
 
-Plan restricted `GET /actuator/health/liveness` and `GET /actuator/health/readiness`, returning `200` when healthy and `503` when unhealthy. These require future Spring Boot configuration and infrastructure access controls. Detailed health and metrics must not be publicly exposed.
+Implemented: `GET /actuator/health` returns `200` with `{"status":"UP"}` for the current application. Only health is exposed; components and details are hidden. The Actuator discovery endpoint may list health. Default binding is loopback. Separate readiness/liveness probes and infrastructure access restrictions are planned.
+
+Spring MVC Problem Details is enabled for framework errors, such as an unknown resource returning `application/problem+json` with `status`, `title`, `detail`, `type`, and `instance`. Gateway errors now use the same Problem Details convention with a `code` extension. Default servlet error responses suppress exception names, messages, binding errors, and stack traces. The global advice sanitizes domain and unexpected errors while preserving framework HTTP status handling.
 
 ## 8. Eight-phase implementation roadmap
 
-Every phase is **not started**. Implement one capability at a time using failing tests, implementation, and refactoring. Obtain dependency approval before adding libraries.
+Phases 1 and 2 (the requested mock-provider slice) are implemented; phases 3–8 are **not started**. Model discovery and real-provider integration remain future work. Implement one capability at a time using failing tests, implementation, and refactoring. Obtain dependency approval before adding libraries.
 
 | Phase | Scope | Exit criteria |
 | --- | --- | --- |
-| 1. Foundation | Verify JDK 26 tooling/framework compatibility; replace sample with Spring Boot; establish module/configuration and test setup | JDK 26 build, application startup, and smoke/configuration tests pass |
-| 2. API/provider vertical slice | Implement completion/models contracts, validation, errors, and one provider adapter | Contract and controlled-upstream adapter tests pass; authorized development smoke call succeeds |
+| 1. Foundation — implemented | Java 21 Spring Boot bootstrap, capability packages, configuration, health, tests, CI, optional Docker | Verify with `./mvnw clean verify`, local startup, and health check; Docker and hosted CI need their own execution |
+| 2. Unified API/mock provider — implemented | Completion contract, validation, errors, provider boundary, deterministic mock, enable/disable switch | Unit/HTTP contract tests and local curl pass; model discovery and real adapters remain deferred |
 | 3. Identity/persistence | Add PostgreSQL schema/migrations, tenants, hashed keys, authorization, rotation/revocation | Unauthorized access rejected; tenant isolation and revocation verified; no plaintext keys stored |
 | 4. Distributed rate limiting | Add atomic Redis request limits and dependency failure policy | Concurrency/window boundaries, `429` headers, outage behavior, and two-replica enforcement verified |
 | 5. Routing/resilience | Add second provider, model policies, health selection, deadlines, breakers, bounded retries/fallback | Provider substitution requires no API changes; timeout, ambiguity, fallback, and concurrency tests pass |
@@ -237,30 +211,85 @@ Every phase is **not started**. Implement one capability at a time using failing
 
 Phase 2 stays restricted to local development until phase 3 authentication is complete. Intermediate work must not expose an unauthenticated public provider proxy.
 
-## 9. Local development prerequisites
+## 9. Local setup, build, run, and test
 
-For the intended implementation:
+Required: JDK 21, Git, and network access to Maven Central on the first wrapper/build invocation. A separate Maven installation is unnecessary. Docker with Compose is optional. No database, Redis, or provider credentials are needed.
 
-- JDK 26 and `JAVA_HOME` pointing to its installation.
-- Maven; supported version and wrapper will be established in phase 1.
-- Docker with Compose support for planned PostgreSQL and Redis services.
-- Git and an IDE supporting Java 26.
-- Provider account/key only for explicitly enabled live tests; normal tests use stubs.
+On macOS, select JDK 21 explicitly when several JDKs are installed:
 
 ```sh
+export JAVA_HOME="$(/usr/libexec/java_home -v 21)"
+export PATH="$JAVA_HOME/bin:$PATH"
 java -version
-mvn -version
-docker --version
-docker compose version
+./mvnw --version
+./mvnw clean verify
+./mvnw spring-boot:run
 ```
 
-**Current limitation:** the Maven scaffold targets Java 26, but the gateway is not implemented and build compatibility has not been verified. There is no working gateway startup command, Compose setup, migration configuration, or Spring Boot run configuration yet.
+On other platforms, set `JAVA_HOME` to your JDK 21 installation. Windows users can use `mvnw.cmd` instead of `./mvnw`.
 
-Planned configuration covers database/Redis connectivity, provider credentials, model mappings, quotas, deadlines, and cache policy. Document exact names when implemented. Inject secrets through environment variables or a secret manager; never commit credentials or hardcode production defaults.
+In another terminal:
 
-Once phase 1 establishes the application and test setup on JDK 26, use `mvn verify` as the intended verification command. Document startup and service commands only once their supporting files exist.
+```sh
+curl --fail http://127.0.0.1:8080/actuator/health
+```
 
-## 10. Testing and deployment strategy — planned
+Expected response: `{"status":"UP"}`. Stop the app with Ctrl+C. To run the packaged application after verification:
+
+```sh
+java -jar target/Distriubuted_AI_Gateway-1.0-SNAPSHOT.jar
+```
+
+### Configuration
+
+`application.yml` provides a default `local` profile, a `test` profile with an ephemeral port, and a `prod` profile with ECS JSON console logs. Shared defaults hide health details and servlet error diagnostics and enable graceful shutdown.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SPRING_PROFILES_ACTIVE` | `local` (default profile) | Select environment profile |
+| `SERVER_ADDRESS` | `127.0.0.1` | Bind address; containers set `0.0.0.0` |
+| `SERVER_PORT` | `8080` | Application port |
+| `LOG_LEVEL` | `INFO` | Root log level |
+| `MOCK_PROVIDER_ENABLED` | `true` | Enable mock adapter; false makes `mock-chat` return 503 |
+
+Spring Boot does not load `.env` automatically. The example contains only non-secret settings. For a trusted local file in a POSIX shell:
+
+```sh
+cp .env.example .env
+set -a
+. ./.env
+set +a
+./mvnw spring-boot:run
+```
+
+Production-profile example:
+
+```sh
+SPRING_PROFILES_ACTIVE=prod SERVER_PORT=9090 ./mvnw spring-boot:run
+```
+
+The production profile alone does not supply TLS or authentication. Keep deployment access controlled until those features exist. Never commit credentials or hardcode production defaults.
+
+### Tests
+
+```sh
+./mvnw test          # Surefire: unit/configuration tests ending in Test
+./mvnw clean verify  # Also runs Failsafe HTTP integration tests ending in IT
+```
+
+Tests require no external services or credentials. HTTP integration tests start the real application on an ephemeral port under the `test` profile. Reports are written to ignored `target/surefire-reports` and `target/failsafe-reports`.
+
+### Optional Docker execution
+
+```sh
+docker compose up --build -d
+curl --fail http://127.0.0.1:8080/actuator/health
+docker compose down
+```
+
+Compose runs only the gateway and binds the published port to host loopback. Its `.env` support comes from Compose, independently of Spring Boot. The multi-stage Docker build runs `clean verify`, then copies the executable JAR into a Java 21 runtime image running as a numeric non-root user. Docker execution must be verified separately from a Maven build.
+
+## 10. Testing and deployment strategy
 
 ### Testing
 
@@ -272,15 +301,15 @@ Use incremental test-driven development and run tests after application changes.
 - **Load/multi-replica tests:** Measure gateway overhead and verify shared quotas, concurrency bounds, pools, and configuration freshness with controlled upstreams.
 - **Security/recovery tests:** Cover rotation/revocation, secret redaction, oversized requests, authorization, shutdown, and dependency recovery.
 
-No tests are currently configured. A documentation-only change does not verify application behavior or build compatibility.
+Implemented tests check safe configuration defaults, production logging and external overrides, real-HTTP health, management endpoint exposure, and framework Problem Details. Phase 2 tests cover deterministic completions, validation, unknown models, truncation, safe failure mapping, and disabled-provider startup. Additional capability, dependency, load, and security tests remain planned.
 
 ### Deployment
 
-Ship one versioned modular-monolith artifact, initially in one container, with PostgreSQL and Redis as shared services. Terminate TLS at ingress, inject secrets externally, run without root privileges, and restrict operational endpoints.
+The implemented foundation builds one executable modular-monolith JAR and provides an optional application container. PostgreSQL and Redis are not introduced in Phase 1; add them only when required by a feature. Terminate TLS at ingress, inject secrets externally, run without root privileges, and restrict operational endpoints.
 
-Planned CI will build on JDK 26, run unit/integration/contract checks, scan dependencies/images, and produce an immutable image with a Java 26 runtime. Promote the same image through staging and production after smoke tests and migration review.
+GitHub Actions CI is configured to use Temurin JDK 21 and run `./mvnw --batch-mode --no-transfer-progress clean verify` on pushes and pull requests, with read-only repository permissions. Hosted CI execution has not been observed locally. Dependency/image scans, image publication, staging promotion, and deployment automation remain planned.
 
-Use backward-compatible migrations with separately controlled execution, readiness-gated rollout, and graceful draining. Keep the previous image for application rollback. Database recovery needs a reviewed plan; do not assume migrations are reversible. Verify backups/restoration and Redis-loss behavior. No CI pipeline, image definition, deployment manifest, or production environment is represented in this repository yet.
+Use backward-compatible migrations with separately controlled execution, readiness-gated rollout, and graceful draining. Keep the previous image for application rollback. Database recovery needs a reviewed plan; do not assume migrations are reversible. Verify backups/restoration and Redis-loss behavior. A CI workflow, Dockerfile, and local Compose configuration now exist. Production deployment manifests, migrations, runbooks, and environments remain planned.
 
 ## 11. Future improvements
 
