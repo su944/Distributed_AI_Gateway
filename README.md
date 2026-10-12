@@ -4,9 +4,9 @@ A production-oriented gateway providing a consistent API over multiple AI provid
 
 ## Current status
 
-**Phase 1 foundation and Phase 2 unified chat API with a deterministic mock provider are implemented.** The application uses Java 21, Spring Boot 3.5.16, and Maven. It includes capability package documentation, profile/environment configuration, minimal Actuator health, framework error conventions, JUnit 5 unit and HTTP integration tests, a Maven wrapper, CI, and optional application-only Docker execution.
+**Phases 1–3 are implemented: foundation, unified mock chat API, and an optional OpenAI Chat Completions adapter.** The application uses Java 21, Spring Boot 3.5.16, and Maven. It includes capability package documentation, profile/environment configuration, minimal Actuator health, framework error conventions, JUnit 5 unit and HTTP integration tests, a Maven wrapper, CI, and optional application-only Docker execution.
 
-`POST /v1/chat/completions`, Bean Validation, provider selection, sanitized Problem Details, and mock enable/disable configuration are implemented. Real providers, model discovery, authentication, tenant management, policy routing, rate limiting, caching, persistence, and durable usage accounting remain planned. No external services or credentials are required.
+`POST /v1/chat/completions`, Bean Validation, provider selection, sanitized Problem Details, and mock enable/disable configuration are implemented. The OpenAI adapter uses Spring WebClient with configurable model aliases, deadlines, sanitized errors, and no automatic retries. Model discovery, authentication, tenant management, policy routing, rate limiting, caching, persistence, and durable usage accounting remain planned. The default mock path requires no external services or credentials; OpenAI calls require an operator-supplied API key.
 
 ## 1. Overview and problem statement
 
@@ -66,14 +66,14 @@ Start with one adapter. Add a second to prove API and routing logic remain indep
 | Technology | Intended role | Current state |
 | --- | --- | --- |
 | Java 21 | Runtime and language baseline | Configured with compiler release 21 |
-| Spring Boot 3.5.16 | HTTP foundation, configuration, injection, health | Implemented; mock chat endpoint available |
+| Spring Boot 3.5.16 | HTTP foundation, configuration, injection, health | Implemented; mock and optional OpenAI chat available |
 | Maven 3.9.11 | Build and dependency management | Wrapper included |
 | PostgreSQL | Tenants, hashed API keys, model mappings, policies, usage metadata | Not integrated |
 | Redis | Atomic rate counters and expiring response cache | Not integrated |
 | Docker | Optional application container | Dockerfile and application-only Compose included |
 | JUnit 5 and Mockito | Unit and module tests | Available through Boot test starter; unit and HTTP integration tests included |
 
-Direct dependencies are the web, validation, Actuator, and test starters plus the existing Prometheus registry. Only health is exposed over HTTP. Provider HTTP client, persistence/migration tools, and resilience tooling remain to be selected. **Ask before introducing any new dependency**, as required by `AGENTS.md`.
+Direct dependencies are the web, WebFlux (WebClient/Reactor Netty), validation, Actuator, and test starters plus the existing Prometheus registry. The server remains Spring MVC. Only health is exposed over HTTP. Persistence/migration tools and circuit-breaker tooling remain to be selected. **Ask before introducing any new dependency**, as required by `AGENTS.md`.
 
 ## 6. High-level system architecture
 
@@ -109,7 +109,7 @@ flowchart LR
 - **Persistence:** Repository interfaces and storage implementations.
 - **Observability:** Sanitized usage events, correlation, metrics, and traces.
 
-The implemented root is `com.sunny.gateway`, with documented capability packages: `gateway`, `provider`, `routing`, `authentication`, `ratelimit`, `tenant`, `usage`, `config`, and `common`. The gateway API/orchestrator, provider interface/mock adapter, and simple provider selector are implemented; other capability implementations remain planned. These packages are code boundaries within one deployable application. Domain/application code depends on interfaces implemented by infrastructure adapters. Modules communicate through public contracts rather than accessing implementation details.
+The implemented root is `com.sunny.gateway`, with documented capability packages: `gateway`, `provider`, `routing`, `authentication`, `ratelimit`, `tenant`, `usage`, `config`, and `common`. The gateway API/orchestrator, provider interface, mock/OpenAI adapters, and simple provider selector are implemented; other capability implementations remain planned. These packages are code boundaries within one deployable application. Domain/application code depends on interfaces implemented by infrastructure adapters. Modules communicate through public contracts rather than accessing implementation details.
 
 ### Request flow and failure policy
 
@@ -132,7 +132,7 @@ Horizontal scaling adds replicas behind the load balancer. Verify distributed qu
 
 ### Implemented: `POST /v1/chat/completions`
 
-The Phase 2 API is a small synchronous text-chat contract, not full OpenAI compatibility. It needs no authentication or credentials. It supports only `mock-chat` and returns one assistant choice. `GET /v1/models`, streaming, request correlation headers, real providers, and the broader future contracts remain planned.
+The Phase 2 API is a small synchronous text-chat contract, not full OpenAI compatibility. It has no gateway authentication and returns one assistant choice. `mock-chat` requires no credentials; `openai-chat` is available when OpenAI is enabled and configured. `GET /v1/models`, streaming, request correlation headers, additional providers, and the broader future contracts remain planned.
 
 ```sh
 curl --fail-with-body http://127.0.0.1:8080/v1/chat/completions \
@@ -177,16 +177,19 @@ All errors use Spring MVC Problem Details (`application/problem+json`). Domain a
 | Status | Code | Meaning |
 | --- | --- | --- |
 | `400` | `invalid_request` | Invalid messages/options, malformed JSON, or unknown fields |
-| `400` | `unsupported_model` | Model other than `mock-chat` |
-| `503` | `provider_unavailable` | Mock provider disabled |
-| `502` | `provider_error` | Adapter throws a typed provider failure |
+| `400` | `unsupported_model` | No enabled provider supports the requested alias (including OpenAI aliases when disabled) |
+| `503` | `provider_unavailable` | Mock disabled, or OpenAI returns 429/503 |
+| `503` | `provider_credentials_missing` | Enabled OpenAI selected without `OPENAI_API_KEY` |
+| `503` | `provider_authentication_error` | OpenAI returns 401/403; this is provider authentication, not client authentication |
+| `504` | `provider_timeout` | Connection, response-read, or overall deadline exceeded |
+| `502` | `provider_error` | OpenAI 400/500/other error, connection failure, malformed/empty/oversized response, or adapter failure |
 | `500` | `internal_error` | Unexpected failure, with sanitized detail |
 
 The mock does not expose a client-controlled failure trigger. Tests substitute a failing provider to verify error mapping through the controller/service/interface path.
 
 ### Implemented class boundaries
 
-`ChatCompletionController` validates HTTP requests and delegates to `GatewayService`. The service asks `routing.ProviderSelector` for the first registered provider supporting the model, then calls `provider.LLMProvider`. `MockLLMProvider` implements that boundary and is conditionally registered. Request/message/response records define the client contract; `GatewayExceptionHandler` maps gateway, adapter, validation, and parsing failures. No routing policy engine or speculative storage abstractions are introduced.
+`ChatCompletionController` validates HTTP requests and delegates to `GatewayService`. The service asks `routing.ProviderSelector` for the first registered provider supporting the model, then calls `provider.LLMProvider`. `MockLLMProvider` implements that boundary and is conditionally registered. Request/message/response records define the client contract; `GatewayExceptionHandler` maps gateway, adapter, validation, and parsing failures. `provider.openai` owns configuration, WebClient transport, wire DTOs, and mapping. No routing policy engine or speculative storage abstractions are introduced.
 
 ### Operational endpoints
 
@@ -196,24 +199,24 @@ Spring MVC Problem Details is enabled for framework errors, such as an unknown r
 
 ## 8. Eight-phase implementation roadmap
 
-Phases 1 and 2 (the requested mock-provider slice) are implemented; phases 3–8 are **not started**. Model discovery and real-provider integration remain future work. Implement one capability at a time using failing tests, implementation, and refactoring. Obtain dependency approval before adding libraries.
+Phases 1–3 are implemented, with Phase 3 now scoped to the requested OpenAI integration. The original identity/persistence Phase 3 proposal is deferred. Phases 4–8, identity/persistence, and model discovery remain **not started**. Implement one capability at a time using failing tests, implementation, and refactoring. Obtain dependency approval before adding libraries.
 
 | Phase | Scope | Exit criteria |
 | --- | --- | --- |
 | 1. Foundation — implemented | Java 21 Spring Boot bootstrap, capability packages, configuration, health, tests, CI, optional Docker | Verify with `./mvnw clean verify`, local startup, and health check; Docker and hosted CI need their own execution |
 | 2. Unified API/mock provider — implemented | Completion contract, validation, errors, provider boundary, deterministic mock, enable/disable switch | Unit/HTTP contract tests and local curl pass; model discovery and real adapters remain deferred |
-| 3. Identity/persistence | Add PostgreSQL schema/migrations, tenants, hashed keys, authorization, rotation/revocation | Unauthorized access rejected; tenant isolation and revocation verified; no plaintext keys stored |
+| 3. OpenAI integration — implemented | WebClient adapter, model aliases, environment credentials, timeouts, safe errors, no retries | Mapping/configuration tests and local HTTP-stub tests pass; live paid calls are not automated |
 | 4. Distributed rate limiting | Add atomic Redis request limits and dependency failure policy | Concurrency/window boundaries, `429` headers, outage behavior, and two-replica enforcement verified |
 | 5. Routing/resilience | Add second provider, model policies, health selection, deadlines, breakers, bounded retries/fallback | Provider substitution requires no API changes; timeout, ambiguity, fallback, and concurrency tests pass |
 | 6. Response caching | Add opt-in policy, TTLs, isolation, and configuration-sensitive keys | Hit/miss, expiry, option sensitivity, invalidation, isolation, and cache outage tests pass |
 | 7. Production hardening | Add metrics/traces, usage metadata, secret redaction, resource limits, graceful shutdown | Failures diagnosable; sensitive-data checks pass; load baseline and proposed SLOs reviewed |
 | 8. Deployment/scale validation | Add Docker/local services, CI, runbooks, migrations/rollback, multi-replica exercises | Staging rollout, scale, dependency recovery, backup restoration, and rollback verified |
 
-Phase 2 stays restricted to local development until phase 3 authentication is complete. Intermediate work must not expose an unauthenticated public provider proxy.
+The gateway stays restricted to trusted local development until a future identity phase supplies authentication. The current OpenAI integration does not provide authentication; do not expose it as an unauthenticated public provider proxy.
 
 ## 9. Local setup, build, run, and test
 
-Required: JDK 21, Git, and network access to Maven Central on the first wrapper/build invocation. A separate Maven installation is unnecessary. Docker with Compose is optional. No database, Redis, or provider credentials are needed.
+Required: JDK 21, Git, and network access to Maven Central on the first wrapper/build invocation. A separate Maven installation is unnecessary. Docker with Compose is optional. No database or Redis is needed. Provider credentials are required only for explicitly enabled real OpenAI calls.
 
 On macOS, select JDK 21 explicitly when several JDKs are installed:
 
@@ -227,6 +230,8 @@ java -version
 ```
 
 On other platforms, set `JAVA_HOME` to your JDK 21 installation. Windows users can use `mvnw.cmd` instead of `./mvnw`.
+
+On Apple Silicon macOS with an ARM JDK (`os.arch=aarch64`), Maven automatically activates `macos-arm64-dns` to include Netty's native macOS DNS resolver. Its version follows Spring Boot's managed Netty version. This resolves the native-library loading error reported by WebClient on ARM Macs. Linux and Intel builds do not activate this profile.
 
 In another terminal:
 
@@ -251,6 +256,12 @@ java -jar target/Distriubuted_AI_Gateway-1.0-SNAPSHOT.jar
 | `SERVER_PORT` | `8080` | Application port |
 | `LOG_LEVEL` | `INFO` | Root log level |
 | `MOCK_PROVIDER_ENABLED` | `true` | Enable mock adapter; false makes `mock-chat` return 503 |
+| `OPENAI_ENABLED` | `false` | Register the real provider and its WebClient |
+| `OPENAI_API_KEY` | empty | Server-side Bearer credential, read from the environment |
+| `OPENAI_CHAT_MODEL` | `gpt-4o-mini` | Vendor model behind `openai-chat` |
+| `OPENAI_CONNECT_TIMEOUT` | `5s` | TCP connection timeout |
+| `OPENAI_RESPONSE_TIMEOUT` | `30s` | Maximum interval between response network reads |
+| `OPENAI_REQUEST_TIMEOUT` | `40s` | Overall adapter deadline, including connection and decoding |
 
 Spring Boot does not load `.env` automatically. The example contains only non-secret settings. For a trusted local file in a POSIX shell:
 
@@ -270,6 +281,43 @@ SPRING_PROFILES_ACTIVE=prod SERVER_PORT=9090 ./mvnw spring-boot:run
 
 The production profile alone does not supply TLS or authentication. Keep deployment access controlled until those features exist. Never commit credentials or hardcode production defaults.
 
+### Running the real OpenAI provider
+
+Export `OPENAI_API_KEY` through your trusted local environment or edit your ignored `.env` copy (leave the committed example empty). Spring does not load `.env` automatically. With the key already exported:
+
+```sh
+OPENAI_ENABLED=true ./mvnw spring-boot:run
+```
+
+Then call the gateway; the key is never sent by the client to this endpoint:
+
+```sh
+curl --fail-with-body http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"openai-chat","messages":[{"role":"system","content":"Be concise."},{"role":"user","content":"Explain consistent hashing in one sentence."}],"temperature":0.2,"max_tokens":128}'
+```
+
+This explicit real-provider example makes a billable OpenAI request when valid credentials and model access are available. It was not executed against OpenAI during automated verification. The mock example continues to work whether OpenAI is enabled or disabled.
+
+Supported aliases are `mock-chat` and, when enabled, `openai-chat → gpt-4o-mini`. Override the latter with `OPENAI_CHAT_MODEL`. Add aliases through operator-controlled Spring configuration:
+
+```yaml
+gateway:
+  openai:
+    models:
+      team-chat: gpt-4o-mini
+```
+
+Use aliases as the client `model`; successful normalized responses report that alias, even if OpenAI reports a versioned model name. Alias/model values must be nonblank and `mock-chat` is reserved. Timeouts must be between 1ms and one day. Invalid model/timeout configuration fails startup. Enabling without credentials still allows startup, health, and mock requests; selecting OpenAI then returns `503 provider_credentials_missing` without a network call.
+
+The adapter sends exactly one non-streaming completion to `https://api.openai.com/v1/chat/completions`. Roles/content are copied in order. Optional temperature is sent only when supplied; gateway `max_tokens` becomes OpenAI `max_completion_tokens`. Omitting it leaves the vendor default. Mapping a model does not guarantee it supports temperature, these roles, or text-only chat; use compatible Chat Completions models. See the [OpenAI Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) and [GPT-4o mini documentation](https://developers.openai.com/api/docs/models/gpt-4o-mini).
+
+OpenAI response IDs, assistant text, and integer token usage are normalized without estimates. Finish reasons are `stop`, `length`, `content_filter`, or `unknown`. Empty bodies, missing ID/model/text/usage, inconsistent usage, and unsupported response structures return `502`. Unknown vendor metadata is ignored. Responses are limited to 1 MiB in memory. Tool calls, multimodal output, refusal metadata, and streaming are not supported. A refusal without text returns `502` rather than fabricating a completion.
+
+Provider error bodies are discarded; their contents, exception causes, and credentials are not returned or logged by the adapter. Redirect following and Reactor Netty's transport replay are explicitly disabled, and no application retries or fallbacks are added. A timeout cannot establish whether OpenAI already generated/billed a response, so manually replaying a POST may incur another charge. The synchronous MVC contract waits on WebClient until the configured deadline.
+
+Compose forwards the same OpenAI environment settings, including the key at runtime. No secret enters the image or committed configuration. Keep access local while gateway authentication remains deferred.
+
 ### Tests
 
 ```sh
@@ -277,7 +325,7 @@ The production profile alone does not supply TLS or authentication. Keep deploym
 ./mvnw clean verify  # Also runs Failsafe HTTP integration tests ending in IT
 ```
 
-Tests require no external services or credentials. HTTP integration tests start the real application on an ephemeral port under the `test` profile. Reports are written to ignored `target/surefire-reports` and `target/failsafe-reports`.
+Tests require no external services or credentials and make no live or paid OpenAI calls. The test profile disables OpenAI regardless of ambient `OPENAI_ENABLED`; adapter tests use only a loopback JDK HTTP server and a fake credential. HTTP integration tests start the real application on an ephemeral port under the `test` profile. Reports are written to ignored `target/surefire-reports` and `target/failsafe-reports`.
 
 ### Optional Docker execution
 
@@ -301,7 +349,7 @@ Use incremental test-driven development and run tests after application changes.
 - **Load/multi-replica tests:** Measure gateway overhead and verify shared quotas, concurrency bounds, pools, and configuration freshness with controlled upstreams.
 - **Security/recovery tests:** Cover rotation/revocation, secret redaction, oversized requests, authorization, shutdown, and dependency recovery.
 
-Implemented tests check safe configuration defaults, production logging and external overrides, real-HTTP health, management endpoint exposure, and framework Problem Details. Phase 2 tests cover deterministic completions, validation, unknown models, truncation, safe failure mapping, and disabled-provider startup. Additional capability, dependency, load, and security tests remain planned.
+Implemented tests check safe configuration defaults, production logging and external overrides, real-HTTP health, management endpoint exposure, and framework Problem Details. Phase 2 tests cover deterministic completions, validation, unknown models, truncation, safe failure mapping, and disabled-provider startup. Phase 3 tests cover wire mapping, model/timeout configuration, Bearer headers, local HTTP success, 400/401/403/429/500/503 errors, malformed/empty responses, missing credentials, response/overall timeouts, refused connections, and connection resets without retry. Additional capability, dependency, load, and security tests remain planned.
 
 ### Deployment
 

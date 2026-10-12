@@ -1,0 +1,4 @@
+# Never enable a real provider through ambient environment variables in tests.
+gateway:
+  openai:
+    enabled: false

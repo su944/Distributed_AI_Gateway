@@ -1,4 +1,4 @@
 /**
- * Provider integration boundary and deterministic mock adapter; real adapters remain planned.
+ * Provider integration boundary and deterministic mock and OpenAI Chat Completions adapters.
  */
 package com.sunny.gateway.provider;

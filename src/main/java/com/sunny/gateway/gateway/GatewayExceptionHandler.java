@@ -19,7 +19,13 @@ public class GatewayExceptionHandler extends ResponseEntityExceptionHandler {
     }
     @ExceptionHandler(ProviderException.class)
     ProblemDetail providerError(ProviderException exception) {
-        return problem(HttpStatus.BAD_GATEWAY, "provider_error", "The provider could not complete the request.");
+        return switch (exception.reason()) {
+            case ERROR -> problem(HttpStatus.BAD_GATEWAY, "provider_error", "The provider could not complete the request.");
+            case MISSING_CREDENTIALS -> problem(HttpStatus.SERVICE_UNAVAILABLE, "provider_credentials_missing", "The selected provider requires configured credentials.");
+            case AUTHENTICATION -> problem(HttpStatus.SERVICE_UNAVAILABLE, "provider_authentication_error", "The provider could not authenticate the gateway.");
+            case UNAVAILABLE -> problem(HttpStatus.SERVICE_UNAVAILABLE, "provider_unavailable", "The provider is temporarily unavailable.");
+            case TIMEOUT -> problem(HttpStatus.GATEWAY_TIMEOUT, "provider_timeout", "The provider request timed out.");
+        };
     }
     @ExceptionHandler(Exception.class)
     ProblemDetail unexpectedError(Exception exception) {
