@@ -14,5 +14,29 @@ services:
       OPENAI_CONNECT_TIMEOUT: ${OPENAI_CONNECT_TIMEOUT:-5s}
       OPENAI_RESPONSE_TIMEOUT: ${OPENAI_RESPONSE_TIMEOUT:-30s}
       OPENAI_REQUEST_TIMEOUT: ${OPENAI_REQUEST_TIMEOUT:-40s}
+      DB_URL: jdbc:postgresql://postgres:5432/gateway
+      DB_USERNAME: ${DB_USERNAME:-gateway}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+      GATEWAY_API_KEY_PEPPER: ${GATEWAY_API_KEY_PEPPER:?Set GATEWAY_API_KEY_PEPPER}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
     stop_grace_period: 30s
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: ${DB_USERNAME:-gateway}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - gateway-postgres:/var/lib/postgresql/data
+volumes:
+  gateway-postgres:

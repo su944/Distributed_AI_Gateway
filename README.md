@@ -4,9 +4,9 @@ A production-oriented gateway providing a consistent API over multiple AI provid
 
 ## Current status
 
-**Phases 1–3 are implemented: foundation, unified mock chat API, and an optional OpenAI Chat Completions adapter.** The application uses Java 21, Spring Boot 3.5.16, and Maven. It includes capability package documentation, profile/environment configuration, minimal Actuator health, framework error conventions, JUnit 5 unit and HTTP integration tests, a Maven wrapper, CI, and optional application-only Docker execution.
+**Phases 1–4 are implemented: foundation, unified mock API, optional OpenAI adapter, and PostgreSQL-backed tenant API-key authentication.** The application uses Java 21, Spring Boot 3.5.16, and Maven. It includes capability package documentation, profile/environment configuration, minimal Actuator health, framework error conventions, JUnit 5 unit and HTTP integration tests, a Maven wrapper, CI, and optional application-only Docker execution.
 
-`POST /v1/chat/completions`, Bean Validation, provider selection, sanitized Problem Details, and mock enable/disable configuration are implemented. The OpenAI adapter uses Spring WebClient with configurable model aliases, deadlines, sanitized errors, and no automatic retries. Model discovery, authentication, tenant management, policy routing, rate limiting, caching, persistence, and durable usage accounting remain planned. The default mock path requires no external services or credentials; OpenAI calls require an operator-supplied API key.
+`POST /v1/chat/completions`, Bean Validation, provider selection, sanitized Problem Details, and mock enable/disable configuration are implemented. The OpenAI adapter uses Spring WebClient with configurable model aliases, deadlines, sanitized errors, and no automatic retries. Tenant/key persistence and stateless API-key authentication are implemented. Model discovery, policy routing, rate limiting, caching, and usage billing remain planned. All chat requests now require an issued gateway key; PostgreSQL and a separate gateway HMAC pepper are required. Mock chat needs no OpenAI credentials.
 
 ## 1. Overview and problem statement
 
@@ -68,12 +68,12 @@ Start with one adapter. Add a second to prove API and routing logic remain indep
 | Java 21 | Runtime and language baseline | Configured with compiler release 21 |
 | Spring Boot 3.5.16 | HTTP foundation, configuration, injection, health | Implemented; mock and optional OpenAI chat available |
 | Maven 3.9.11 | Build and dependency management | Wrapper included |
-| PostgreSQL | Tenants, hashed API keys, model mappings, policies, usage metadata | Not integrated |
+| PostgreSQL | Tenants and HMAC API-key digests; future model policies and usage | Integrated through JPA and Flyway |
 | Redis | Atomic rate counters and expiring response cache | Not integrated |
-| Docker | Optional application container | Dockerfile and application-only Compose included |
+| Docker | Application container, local PostgreSQL, integration tests | Compose PostgreSQL and Testcontainers included |
 | JUnit 5 and Mockito | Unit and module tests | Available through Boot test starter; unit and HTTP integration tests included |
 
-Direct dependencies are the web, WebFlux (WebClient/Reactor Netty), validation, Actuator, and test starters plus the existing Prometheus registry. The server remains Spring MVC. Only health is exposed over HTTP. Persistence/migration tools and circuit-breaker tooling remain to be selected. **Ask before introducing any new dependency**, as required by `AGENTS.md`.
+Direct dependencies include web, WebFlux (WebClient/Reactor Netty), validation, Actuator, Security, Data JPA, Flyway core/PostgreSQL support, PostgreSQL JDBC, and tests (including Testcontainers and Spring Security test support), plus the existing Prometheus registry. The server remains Spring MVC. Only health is exposed over HTTP. Circuit-breaker tooling remains deferred. **Ask before introducing any new dependency**, as required by `AGENTS.md`.
 
 ## 6. High-level system architecture
 
@@ -109,7 +109,7 @@ flowchart LR
 - **Persistence:** Repository interfaces and storage implementations.
 - **Observability:** Sanitized usage events, correlation, metrics, and traces.
 
-The implemented root is `com.sunny.gateway`, with documented capability packages: `gateway`, `provider`, `routing`, `authentication`, `ratelimit`, `tenant`, `usage`, `config`, and `common`. The gateway API/orchestrator, provider interface, mock/OpenAI adapters, and simple provider selector are implemented; other capability implementations remain planned. These packages are code boundaries within one deployable application. Domain/application code depends on interfaces implemented by infrastructure adapters. Modules communicate through public contracts rather than accessing implementation details.
+The implemented root is `com.sunny.gateway`, with documented capability packages: `gateway`, `provider`, `routing`, `authentication`, `ratelimit`, `tenant`, `usage`, `config`, and `common`. The gateway API/orchestrator, provider interface, mock/OpenAI adapters, and simple provider selector are implemented; tenant and authentication are also implemented; other capability implementations remain planned. These packages are code boundaries within one deployable application. Domain/application code depends on interfaces implemented by infrastructure adapters. Modules communicate through public contracts rather than accessing implementation details.
 
 ### Request flow and failure policy
 
@@ -132,11 +132,12 @@ Horizontal scaling adds replicas behind the load balancer. Verify distributed qu
 
 ### Implemented: `POST /v1/chat/completions`
 
-The Phase 2 API is a small synchronous text-chat contract, not full OpenAI compatibility. It has no gateway authentication and returns one assistant choice. `mock-chat` requires no credentials; `openai-chat` is available when OpenAI is enabled and configured. `GET /v1/models`, streaming, request correlation headers, additional providers, and the broader future contracts remain planned.
+The Phase 2 API is a small synchronous text-chat contract, not full OpenAI compatibility. It requires `Authorization: Bearer <gateway-api-key>` and returns one assistant choice. `mock-chat` requires no OpenAI credentials; `openai-chat` is available when OpenAI is enabled and configured. `GET /v1/models`, streaming, request correlation headers, additional providers, and the broader future contracts remain planned.
 
 ```sh
 curl --fail-with-body http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
   -d '{"model":"mock-chat","messages":[{"role":"system","content":"Be brief"},{"role":"user","content":"Hello world"}],"temperature":0.2,"max_tokens":256}'
 ```
 
@@ -176,6 +177,9 @@ All errors use Spring MVC Problem Details (`application/problem+json`). Domain a
 
 | Status | Code | Meaning |
 | --- | --- | --- |
+| `401` | `unauthorized` | Missing, malformed, invalid, revoked, or expired gateway key; includes `WWW-Authenticate: Bearer` |
+| `403` | `forbidden` | Suspended tenant, missing permission, or route denied by policy |
+| `503` | `authentication_unavailable` | Authentication database is unavailable; fail closed |
 | `400` | `invalid_request` | Invalid messages/options, malformed JSON, or unknown fields |
 | `400` | `unsupported_model` | No enabled provider supports the requested alias (including OpenAI aliases when disabled) |
 | `503` | `provider_unavailable` | Mock disabled, or OpenAI returns 429/503 |
@@ -193,30 +197,30 @@ The mock does not expose a client-controlled failure trigger. Tests substitute a
 
 ### Operational endpoints
 
-Implemented: `GET /actuator/health` returns `200` with `{"status":"UP"}` for the current application. Only health is exposed; components and details are hidden. The Actuator discovery endpoint may list health. Default binding is loopback. Separate readiness/liveness probes and infrastructure access restrictions are planned.
+Implemented: `GET /actuator/health` returns `200` with `{"status":"UP"}` for the current application. Only health is exposed; components and details are hidden. The Actuator discovery endpoint and other routes are denied by default. Default binding is loopback. Separate readiness/liveness probes and infrastructure access restrictions are planned.
 
 Spring MVC Problem Details is enabled for framework errors, such as an unknown resource returning `application/problem+json` with `status`, `title`, `detail`, `type`, and `instance`. Gateway errors now use the same Problem Details convention with a `code` extension. Default servlet error responses suppress exception names, messages, binding errors, and stack traces. The global advice sanitizes domain and unexpected errors while preserving framework HTTP status handling.
 
 ## 8. Eight-phase implementation roadmap
 
-Phases 1–3 are implemented, with Phase 3 now scoped to the requested OpenAI integration. The original identity/persistence Phase 3 proposal is deferred. Phases 4–8, identity/persistence, and model discovery remain **not started**. Implement one capability at a time using failing tests, implementation, and refactoring. Obtain dependency approval before adding libraries.
+Phases 1–4 are implemented as requested, including identity/persistence in Phase 4. Distributed rate limiting is deferred; model discovery and later capability phases remain **not started**. Implement one capability at a time using failing tests, implementation, and refactoring. Obtain dependency approval before adding libraries.
 
 | Phase | Scope | Exit criteria |
 | --- | --- | --- |
 | 1. Foundation — implemented | Java 21 Spring Boot bootstrap, capability packages, configuration, health, tests, CI, optional Docker | Verify with `./mvnw clean verify`, local startup, and health check; Docker and hosted CI need their own execution |
 | 2. Unified API/mock provider — implemented | Completion contract, validation, errors, provider boundary, deterministic mock, enable/disable switch | Unit/HTTP contract tests and local curl pass; model discovery and real adapters remain deferred |
 | 3. OpenAI integration — implemented | WebClient adapter, model aliases, environment credentials, timeouts, safe errors, no retries | Mapping/configuration tests and local HTTP-stub tests pass; live paid calls are not automated |
-| 4. Distributed rate limiting | Add atomic Redis request limits and dependency failure policy | Concurrency/window boundaries, `429` headers, outage behavior, and two-replica enforcement verified |
+| 4. Authentication/tenants — implemented | PostgreSQL/Flyway, tenant/key services, HMAC digests, stateless security, local provisioning | PostgreSQL integration tests verify migrations, authorization, isolation, expiry, revocation, and rotation |
 | 5. Routing/resilience | Add second provider, model policies, health selection, deadlines, breakers, bounded retries/fallback | Provider substitution requires no API changes; timeout, ambiguity, fallback, and concurrency tests pass |
 | 6. Response caching | Add opt-in policy, TTLs, isolation, and configuration-sensitive keys | Hit/miss, expiry, option sensitivity, invalidation, isolation, and cache outage tests pass |
 | 7. Production hardening | Add metrics/traces, usage metadata, secret redaction, resource limits, graceful shutdown | Failures diagnosable; sensitive-data checks pass; load baseline and proposed SLOs reviewed |
 | 8. Deployment/scale validation | Add Docker/local services, CI, runbooks, migrations/rollback, multi-replica exercises | Staging rollout, scale, dependency recovery, backup restoration, and rollback verified |
 
-The gateway stays restricted to trusted local development until a future identity phase supplies authentication. The current OpenAI integration does not provide authentication; do not expose it as an unauthenticated public provider proxy.
+Authentication is now mandatory in local and production web modes. Production still requires infrastructure TLS, controlled management/database access, secret distribution, backups, and deployment hardening. Redis-based rate limiting remains deferred.
 
 ## 9. Local setup, build, run, and test
 
-Required: JDK 21, Git, and network access to Maven Central on the first wrapper/build invocation. A separate Maven installation is unnecessary. Docker with Compose is optional. No database or Redis is needed. Provider credentials are required only for explicitly enabled real OpenAI calls.
+Required: JDK 21, Git, and network access to Maven Central on the first wrapper/build invocation. A separate Maven installation is unnecessary. Compose is optional for runtime PostgreSQL setup, but a working Docker daemon is required for Testcontainers integration tests. PostgreSQL is required at runtime. No Redis is needed. Real OpenAI credentials are optional. Configure `DB_PASSWORD` and `GATEWAY_API_KEY_PEPPER` before startup and provision a gateway key as described below.
 
 On macOS, select JDK 21 explicitly when several JDKs are installed:
 
@@ -226,8 +230,9 @@ export PATH="$JAVA_HOME/bin:$PATH"
 java -version
 ./mvnw --version
 ./mvnw clean verify
-./mvnw spring-boot:run
 ```
+
+Then follow the database/provisioning setup below before `./mvnw spring-boot:run`.
 
 On other platforms, set `JAVA_HOME` to your JDK 21 installation. Windows users can use `mvnw.cmd` instead of `./mvnw`.
 
@@ -255,6 +260,10 @@ java -jar target/Distriubuted_AI_Gateway-1.0-SNAPSHOT.jar
 | `SERVER_ADDRESS` | `127.0.0.1` | Bind address; containers set `0.0.0.0` |
 | `SERVER_PORT` | `8080` | Application port |
 | `LOG_LEVEL` | `INFO` | Root log level |
+| `DB_URL` | `jdbc:postgresql://127.0.0.1:5432/gateway` | PostgreSQL JDBC URL |
+| `DB_USERNAME` | `gateway` | Database role |
+| `DB_PASSWORD` | empty | Required operator-supplied database password |
+| `GATEWAY_API_KEY_PEPPER` | empty | Required separate high-entropy secret, at least 32 bytes |
 | `MOCK_PROVIDER_ENABLED` | `true` | Enable mock adapter; false makes `mock-chat` return 503 |
 | `OPENAI_ENABLED` | `false` | Register the real provider and its WebClient |
 | `OPENAI_API_KEY` | empty | Server-side Bearer credential, read from the environment |
@@ -263,7 +272,7 @@ java -jar target/Distriubuted_AI_Gateway-1.0-SNAPSHOT.jar
 | `OPENAI_RESPONSE_TIMEOUT` | `30s` | Maximum interval between response network reads |
 | `OPENAI_REQUEST_TIMEOUT` | `40s` | Overall adapter deadline, including connection and decoding |
 
-Spring Boot does not load `.env` automatically. The example contains only non-secret settings. For a trusted local file in a POSIX shell:
+Spring Boot does not load `.env` automatically. The example contains empty secret placeholders; set actual values only in the ignored `.env` or trusted environment. Protect `.env` with owner-only permissions. For a trusted local file in a POSIX shell:
 
 ```sh
 cp .env.example .env
@@ -279,7 +288,77 @@ Production-profile example:
 SPRING_PROFILES_ACTIVE=prod SERVER_PORT=9090 ./mvnw spring-boot:run
 ```
 
-The production profile alone does not supply TLS or authentication. Keep deployment access controlled until those features exist. Never commit credentials or hardcode production defaults.
+Both profiles enforce gateway authentication. The production profile does not supply TLS; terminate it at trusted ingress and protect database/management access. No development bypass or default administrator password exists. Never commit credentials.
+
+### PostgreSQL and local provisioning
+
+The gateway runs Flyway's `V1__tenants_and_api_keys.sql` at startup on an empty database and validates tables through Hibernate (`ddl-auto: validate`, open-in-view and SQL/bind logging disabled). No schema changes or public registration are performed by Hibernate. Constraints enforce unique tenant names/slugs/public key identifiers, valid statuses, expiry/revocation consistency, and tenant foreign keys. Back up the database before later migrations; Flyway clean is disabled.
+
+Set a database password and a separate persistent HMAC pepper in your trusted environment. You can generate each with `openssl rand -hex 32`; save them securely and reuse the pepper across restarts/replicas. Rotating the pepper invalidates existing keys because plaintext keys are never stored.
+
+With `DB_PASSWORD` and `GATEWAY_API_KEY_PEPPER` exported (or populated in ignored `.env` and exported):
+
+```sh
+docker compose up -d postgres
+./mvnw clean verify
+mkdir -m 700 .gateway-keys
+```
+
+Provisioning uses explicit command-line operations, not admin endpoints. All commands must use **local**, non-web mode. They are not registered if `prod` is active, even alongside `local`; commands attempted in web mode fail before provisioning. These operations trust the local operator/database environment. Parent directories for key output must be under operator control. Windows operators should provision from a POSIX environment; key-file creation requires owner-only POSIX permissions.
+
+Create and list tenants:
+
+```sh
+java -jar target/Distriubuted_AI_Gateway-1.0-SNAPSHOT.jar \
+  --spring.profiles.active=local --spring.main.web-application-type=none \
+  --gateway.admin.command=tenant-create --gateway.admin.name=Development --gateway.admin.slug=development
+
+java -jar target/Distriubuted_AI_Gateway-1.0-SNAPSHOT.jar \
+  --spring.profiles.active=local --spring.main.web-application-type=none \
+  --gateway.admin.command=tenant-list
+```
+
+Copy the printed tenant UUID into `TENANT_ID` (it is not a credential). Issue a key with `CHAT_COMPLETIONS` permission and optional ISO-8601 expiration:
+
+```sh
+java -jar target/Distriubuted_AI_Gateway-1.0-SNAPSHOT.jar \
+  --spring.profiles.active=local --spring.main.web-application-type=none \
+  --gateway.admin.command=key-issue --gateway.admin.tenant-id="$TENANT_ID" \
+  --gateway.admin.name=local-chat --gateway.admin.output-file=.gateway-keys/local-chat.key
+```
+
+Optional arguments: `--gateway.admin.expires-at=2030-01-01T00:00:00Z` and `--gateway.admin.permissions=none` (a key without chat permission returns 403). The key is written once into a **new file with mode 600**, never printed to stdout; existing paths are rejected. The tool prints only metadata. If persistence/file writing fails, an empty file or undisclosed key record can remain; inspect tenant-scoped metadata and revoke that record, then issue to a fresh filename. No secrets can be recovered from the database.
+
+Use the issued key and start the secured application:
+
+```sh
+export GATEWAY_API_KEY="$(cat .gateway-keys/local-chat.key)"
+./mvnw spring-boot:run
+```
+
+List metadata and revoke a key (copy its UUID into `KEY_ID`):
+
+```sh
+java -jar target/Distriubuted_AI_Gateway-1.0-SNAPSHOT.jar \
+  --spring.profiles.active=local --spring.main.web-application-type=none \
+  --gateway.admin.command=key-list --gateway.admin.tenant-id="$TENANT_ID"
+
+java -jar target/Distriubuted_AI_Gateway-1.0-SNAPSHOT.jar \
+  --spring.profiles.active=local --spring.main.web-application-type=none \
+  --gateway.admin.command=key-revoke --gateway.admin.tenant-id="$TENANT_ID" --gateway.admin.key-id="$KEY_ID"
+```
+
+For rotation, issue a new key into a different file, switch the client and confirm it works, then revoke the old UUID with the command above. The old key remains valid until explicitly revoked, so interruption before the final step does not lock out the client. Revocation is idempotent; expiry is enforced on every request. Delete obsolete local key files securely according to your environment's policy.
+
+Suspend a tenant using `--gateway.admin.command=tenant-status --gateway.admin.tenant-id="$TENANT_ID" --gateway.admin.status=SUSPENDED` with the same local/non-web flags; use `ACTIVE` to restore it. Tenant/key creation, listing, revocation, and suspension have **no public HTTP routes**. Production provisioning requires a controlled operator procedure against its database; this local tool is deliberately absent in production.
+
+### Security flow and compatibility
+
+Chat request/response JSON is unchanged, but clients must now supply a **gateway** Bearer key. `dag_<public-id>_<random-secret>` keys have 256-bit random secrets. Only HMAC-SHA256 digests over the full key are stored, using a server-side pepper distinct from OpenAI credentials. The public identifier locates one key efficiently; comparison is constant-time. Each request checks key status, expiration, and tenant status, then creates an immutable security principal containing tenant/key UUIDs and permissions. `last_used_at` records successful authentication, including requests later denied for insufficient route permission.
+
+Only `GET /actuator/health` is public. `POST /v1/chat/completions` requires `CHAT_COMPLETIONS`; all other routes are denied. Missing/invalid/expired/revoked keys return 401; authenticated forbidden routes, missing permission, and suspended tenants return 403. Database failure fails closed with sanitized 503. Spring Security-generated users, form/basic login, session authentication, request caching, and logout are disabled. CSRF is disabled for this stateless header-authenticated API. Authentication context is cleared after each request; no user key is retained in the principal/session.
+
+Tenant identity comes from the validated key, never JSON or `X-Tenant-ID`. Tenant-scoped key queries require both tenant UUID and key UUID; listings exclude digest/plaintext fields. There are no tenant-data HTTP routes in this phase and no controller returns JPA entities. See [architecture documentation](docs/architecture.md) for boundaries and migration details.
 
 ### Running the real OpenAI provider
 
@@ -289,15 +368,16 @@ Export `OPENAI_API_KEY` through your trusted local environment or edit your igno
 OPENAI_ENABLED=true ./mvnw spring-boot:run
 ```
 
-Then call the gateway; the key is never sent by the client to this endpoint:
+Then call the gateway with a gateway key. The OpenAI key stays server-side and must not be used as the client Bearer key:
 
 ```sh
 curl --fail-with-body http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
   -d '{"model":"openai-chat","messages":[{"role":"system","content":"Be concise."},{"role":"user","content":"Explain consistent hashing in one sentence."}],"temperature":0.2,"max_tokens":128}'
 ```
 
-This explicit real-provider example makes a billable OpenAI request when valid credentials and model access are available. It was not executed against OpenAI during automated verification. The mock example continues to work whether OpenAI is enabled or disabled.
+This explicit real-provider example makes a billable OpenAI request when valid credentials and model access are available. It was not executed against OpenAI during automated verification. The authenticated mock example continues to work whether OpenAI is enabled or disabled.
 
 Supported aliases are `mock-chat` and, when enabled, `openai-chat → gpt-4o-mini`. Override the latter with `OPENAI_CHAT_MODEL`. Add aliases through operator-controlled Spring configuration:
 
@@ -316,7 +396,7 @@ OpenAI response IDs, assistant text, and integer token usage are normalized with
 
 Provider error bodies are discarded; their contents, exception causes, and credentials are not returned or logged by the adapter. Redirect following and Reactor Netty's transport replay are explicitly disabled, and no application retries or fallbacks are added. A timeout cannot establish whether OpenAI already generated/billed a response, so manually replaying a POST may incur another charge. The synchronous MVC contract waits on WebClient until the configured deadline.
 
-Compose forwards the same OpenAI environment settings, including the key at runtime. No secret enters the image or committed configuration. Keep access local while gateway authentication remains deferred.
+Compose forwards the same OpenAI environment settings, including the key at runtime. No secret enters the image or committed configuration. Protect production ingress with TLS; local provisioning is unavailable in the production profile.
 
 ### Tests
 
@@ -325,7 +405,7 @@ Compose forwards the same OpenAI environment settings, including the key at runt
 ./mvnw clean verify  # Also runs Failsafe HTTP integration tests ending in IT
 ```
 
-Tests require no external services or credentials and make no live or paid OpenAI calls. The test profile disables OpenAI regardless of ambient `OPENAI_ENABLED`; adapter tests use only a loopback JDK HTTP server and a fake credential. HTTP integration tests start the real application on an ephemeral port under the `test` profile. Reports are written to ignored `target/surefire-reports` and `target/failsafe-reports`.
+Tests require a working Docker daemon and automatically start a disposable PostgreSQL container; no operator credentials or paid/live OpenAI calls are needed. The test profile disables OpenAI regardless of ambient `OPENAI_ENABLED`; adapter tests use only a loopback JDK HTTP server and a fake credential. HTTP integration tests start the real application on an ephemeral port under the `test` profile. Reports are written to ignored `target/surefire-reports` and `target/failsafe-reports`.
 
 ### Optional Docker execution
 
@@ -335,7 +415,7 @@ curl --fail http://127.0.0.1:8080/actuator/health
 docker compose down
 ```
 
-Compose runs only the gateway and binds the published port to host loopback. Its `.env` support comes from Compose, independently of Spring Boot. The multi-stage Docker build runs `clean verify`, then copies the executable JAR into a Java 21 runtime image running as a numeric non-root user. Docker execution must be verified separately from a Maven build.
+Compose runs the gateway and PostgreSQL and binds published ports to host loopback. Its `.env` support comes from Compose, independently of Spring Boot. Run `./mvnw clean verify` on the host/CI before building. Docker builds run unit tests via `clean package`, because the build stage has no Docker daemon for Testcontainers, then copy the executable JAR into a Java 21 runtime image running as a numeric non-root user. Docker execution must be verified separately from a Maven build.
 
 ## 10. Testing and deployment strategy
 
@@ -349,7 +429,7 @@ Use incremental test-driven development and run tests after application changes.
 - **Load/multi-replica tests:** Measure gateway overhead and verify shared quotas, concurrency bounds, pools, and configuration freshness with controlled upstreams.
 - **Security/recovery tests:** Cover rotation/revocation, secret redaction, oversized requests, authorization, shutdown, and dependency recovery.
 
-Implemented tests check safe configuration defaults, production logging and external overrides, real-HTTP health, management endpoint exposure, and framework Problem Details. Phase 2 tests cover deterministic completions, validation, unknown models, truncation, safe failure mapping, and disabled-provider startup. Phase 3 tests cover wire mapping, model/timeout configuration, Bearer headers, local HTTP success, 400/401/403/429/500/503 errors, malformed/empty responses, missing credentials, response/overall timeouts, refused connections, and connection resets without retry. Additional capability, dependency, load, and security tests remain planned.
+Implemented tests check safe configuration defaults, production logging and external overrides, real-HTTP health, management endpoint exposure, and framework Problem Details. Phase 2 tests cover deterministic completions, validation, unknown models, truncation, safe failure mapping, and disabled-provider startup. Phase 3 tests cover wire mapping, model/timeout configuration, Bearer headers, local HTTP success, 400/401/403/429/500/503 errors, malformed/empty responses, missing credentials, response/overall timeouts, refused connections, and connection resets without retry. Phase 4 adds real PostgreSQL migration/schema validation, key lifecycle, digest-only storage, permissions, tenant isolation, concurrent context cleanup, safe error mapping, and local provisioning tests. Additional rate-limit, load, and deployment-hardening tests remain planned.
 
 ### Deployment
 
@@ -357,7 +437,7 @@ The implemented foundation builds one executable modular-monolith JAR and provid
 
 GitHub Actions CI is configured to use Temurin JDK 21 and run `./mvnw --batch-mode --no-transfer-progress clean verify` on pushes and pull requests, with read-only repository permissions. Hosted CI execution has not been observed locally. Dependency/image scans, image publication, staging promotion, and deployment automation remain planned.
 
-Use backward-compatible migrations with separately controlled execution, readiness-gated rollout, and graceful draining. Keep the previous image for application rollback. Database recovery needs a reviewed plan; do not assume migrations are reversible. Verify backups/restoration and Redis-loss behavior. A CI workflow, Dockerfile, and local Compose configuration now exist. Production deployment manifests, migrations, runbooks, and environments remain planned.
+Use backward-compatible migrations with separately controlled execution, readiness-gated rollout, and graceful draining. Keep the previous image for application rollback. Database recovery needs a reviewed plan; do not assume migrations are reversible. Verify backups/restoration and Redis-loss behavior. A CI workflow, Dockerfile, and local Compose configuration now exist. Flyway identity migrations are implemented; production deployment manifests, broader runbooks, and environments remain planned.
 
 ## 11. Future improvements
 

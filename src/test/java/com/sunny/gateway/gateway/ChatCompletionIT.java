@@ -13,7 +13,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
-class ChatCompletionIT {
+class ChatCompletionIT extends com.sunny.gateway.support.AuthenticatedIntegrationSupport {
     @Autowired TestRestTemplate client;
 
     @Test void validRequestReturnsPredictableCompletion() {
@@ -61,6 +61,6 @@ class ChatCompletionIT {
 
     private ResponseEntity<JsonNode> post(String json) {
         var headers = new HttpHeaders(); headers.setContentType(MediaType.APPLICATION_JSON);
-        return client.postForEntity("/v1/chat/completions", new HttpEntity<>(json, headers), JsonNode.class);
+        return postAuthenticated("/v1/chat/completions", json, JsonNode.class);
     }
 }

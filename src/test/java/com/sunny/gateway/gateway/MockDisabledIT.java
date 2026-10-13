@@ -13,15 +13,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "gateway.mock.enabled=false")
 @ActiveProfiles("test")
-class MockDisabledIT {
+class MockDisabledIT extends com.sunny.gateway.support.AuthenticatedIntegrationSupport {
     @Autowired TestRestTemplate client;
     @Autowired ApplicationContext context;
     @Test void disabledProviderLeavesContextHealthyAndReturns503() {
         assertThat(context.getBeansOfType(LLMProvider.class)).isEmpty();
         var headers = new HttpHeaders(); headers.setContentType(MediaType.APPLICATION_JSON);
-        var response = client.postForEntity("/v1/chat/completions", new HttpEntity<>("""
+        var response = postAuthenticated("/v1/chat/completions", """
             {"model":"mock-chat","messages":[{"role":"user","content":"Hello"}]}
-            """, headers), JsonNode.class);
+            """, JsonNode.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
         assertThat(response.getBody().path("code").asText()).isEqualTo("provider_unavailable");
         assertThat(client.getForEntity("/actuator/health", String.class).getStatusCode()).isEqualTo(HttpStatus.OK);

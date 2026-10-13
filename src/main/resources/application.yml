@@ -1,4 +1,16 @@
 spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://127.0.0.1:5432/gateway}
+    username: ${DB_USERNAME:gateway}
+    password: ${DB_PASSWORD:}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+  flyway:
+    enabled: true
+    clean-disabled: true
   application:
     name: distributed-ai-gateway
   profiles:
@@ -44,6 +56,8 @@ management:
 logging:
   level:
     root: ${LOG_LEVEL:INFO}
+    org.hibernate.SQL: OFF
+    org.hibernate.orm.jdbc.bind: OFF
 ---
 
 spring:

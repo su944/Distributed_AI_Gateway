@@ -44,3 +44,6 @@ build/
 !.env.example
 *.log
 .idea/
+
+# One-time local API-key exports
+.gateway-keys/

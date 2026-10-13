@@ -12,7 +12,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
-class GatewayApplicationIT {
+class GatewayApplicationIT extends com.sunny.gateway.support.AuthenticatedIntegrationSupport {
 
     @Autowired
     private TestRestTemplate client;
@@ -26,17 +26,17 @@ class GatewayApplicationIT {
 
     @Test
     void otherManagementEndpointsAreNotExposed() {
-        assertThat(client.getForEntity("/actuator/metrics", String.class).getStatusCode())
-                .isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(client.getForEntity("/actuator", String.class).getBody()).doesNotContain("/actuator/env");
+        assertThat(getAuthenticated("/actuator/metrics", String.class).getStatusCode())
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(getAuthenticated("/actuator", String.class).getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     @Test
-    void missingResourcesUseStructuredProblemDetailsWithoutStackTraces() {
-        var response = client.getForEntity("/missing-resource", String.class);
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    void deniedRoutesUseStructuredProblemDetailsWithoutStackTraces() {
+        var response = getAuthenticated("/missing-resource", String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
         assertThat(response.getHeaders().getContentType()).isEqualTo(MediaType.APPLICATION_PROBLEM_JSON);
-        assertThat(response.getBody()).contains("\"status\":404", "\"title\":\"Not Found\"")
+        assertThat(response.getBody()).contains("\"status\":403", "\"title\":\"Forbidden\"")
                 .doesNotContain("stackTrace", "java.lang", "exception");
     }
 }
