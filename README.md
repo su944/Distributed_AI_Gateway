@@ -4,9 +4,9 @@ A production-oriented gateway providing a consistent API over multiple AI provid
 
 ## Current status
 
-**Phases 1–4 are implemented: foundation, unified mock API, optional OpenAI adapter, and PostgreSQL-backed tenant API-key authentication.** The application uses Java 21, Spring Boot 3.5.16, and Maven. It includes capability package documentation, profile/environment configuration, minimal Actuator health, framework error conventions, JUnit 5 unit and HTTP integration tests, a Maven wrapper, CI, and optional application-only Docker execution.
+**Phases 1–5 are implemented: foundation, unified mock API, optional OpenAI adapter, PostgreSQL-backed tenant API-key authentication, and Redis-backed distributed tenant rate limiting.** The application uses Java 21, Spring Boot 3.5.16, and Maven. It includes capability package documentation, profile/environment configuration, minimal Actuator health, framework error conventions, JUnit 5 unit and HTTP integration tests, a Maven wrapper, CI, and optional application-only Docker execution.
 
-`POST /v1/chat/completions`, Bean Validation, provider selection, sanitized Problem Details, and mock enable/disable configuration are implemented. The OpenAI adapter uses Spring WebClient with configurable model aliases, deadlines, sanitized errors, and no automatic retries. Tenant/key persistence and stateless API-key authentication are implemented. Model discovery, policy routing, rate limiting, caching, and usage billing remain planned. All chat requests now require an issued gateway key; PostgreSQL and a separate gateway HMAC pepper are required. Mock chat needs no OpenAI credentials.
+`POST /v1/chat/completions`, Bean Validation, provider selection, sanitized Problem Details, and mock enable/disable configuration are implemented. The OpenAI adapter uses Spring WebClient with configurable model aliases, deadlines, sanitized errors, and no automatic retries. Tenant/key persistence and stateless API-key authentication are implemented. Redis token buckets enforce per-tenant request limits across replicas. Model discovery, policy routing, caching, and usage billing remain planned. All chat requests now require an issued gateway key; PostgreSQL, Redis, and a separate gateway HMAC pepper are required under the default fail-closed policy. Mock chat needs no OpenAI credentials.
 
 ## 1. Overview and problem statement
 
@@ -69,11 +69,11 @@ Start with one adapter. Add a second to prove API and routing logic remain indep
 | Spring Boot 3.5.16 | HTTP foundation, configuration, injection, health | Implemented; mock and optional OpenAI chat available |
 | Maven 3.9.11 | Build and dependency management | Wrapper included |
 | PostgreSQL | Tenants and HMAC API-key digests; future model policies and usage | Integrated through JPA and Flyway |
-| Redis | Atomic rate counters and expiring response cache | Not integrated |
-| Docker | Application container, local PostgreSQL, integration tests | Compose PostgreSQL and Testcontainers included |
+| Redis 7+ | Atomic tenant token buckets; future response cache | Implemented with Lua and Spring Data Redis/Lettuce; caching deferred |
+| Docker | Application container, local PostgreSQL, integration tests | Compose PostgreSQL/Redis and Testcontainers included |
 | JUnit 5 and Mockito | Unit and module tests | Available through Boot test starter; unit and HTTP integration tests included |
 
-Direct dependencies include web, WebFlux (WebClient/Reactor Netty), validation, Actuator, Security, Data JPA, Flyway core/PostgreSQL support, PostgreSQL JDBC, and tests (including Testcontainers and Spring Security test support), plus the existing Prometheus registry. The server remains Spring MVC. Only health is exposed over HTTP. Circuit-breaker tooling remains deferred. **Ask before introducing any new dependency**, as required by `AGENTS.md`.
+Direct dependencies include web, WebFlux (WebClient/Reactor Netty), validation, Actuator, Security, Data JPA, Data Redis (Lettuce), Flyway core/PostgreSQL support, PostgreSQL JDBC, and tests (including Testcontainers and Spring Security test support), plus the existing Prometheus registry. The server remains Spring MVC. Only health is exposed over HTTP. Circuit-breaker tooling remains deferred. **Ask before introducing any new dependency**, as required by `AGENTS.md`.
 
 ## 6. High-level system architecture
 
@@ -179,6 +179,8 @@ All errors use Spring MVC Problem Details (`application/problem+json`). Domain a
 | --- | --- | --- |
 | `401` | `unauthorized` | Missing, malformed, invalid, revoked, or expired gateway key; includes `WWW-Authenticate: Bearer` |
 | `403` | `forbidden` | Suspended tenant, missing permission, or route denied by policy |
+| `429` | `rate_limit_exceeded` | Tenant bucket exhausted; includes `Retry-After` |
+| `503` | `rate_limit_unavailable` | Redis unavailable under fail-closed policy |
 | `503` | `authentication_unavailable` | Authentication database is unavailable; fail closed |
 | `400` | `invalid_request` | Invalid messages/options, malformed JSON, or unknown fields |
 | `400` | `unsupported_model` | No enabled provider supports the requested alias (including OpenAI aliases when disabled) |
@@ -203,7 +205,7 @@ Spring MVC Problem Details is enabled for framework errors, such as an unknown r
 
 ## 8. Eight-phase implementation roadmap
 
-Phases 1–4 are implemented as requested, including identity/persistence in Phase 4. Distributed rate limiting is deferred; model discovery and later capability phases remain **not started**. Implement one capability at a time using failing tests, implementation, and refactoring. Obtain dependency approval before adding libraries.
+Phases 1–5 are implemented as requested, including identity/persistence in Phase 4 and distributed token buckets in Phase 5; model discovery and later capability phases remain **not started**. Implement one capability at a time using failing tests, implementation, and refactoring. Obtain dependency approval before adding libraries.
 
 | Phase | Scope | Exit criteria |
 | --- | --- | --- |
@@ -211,16 +213,16 @@ Phases 1–4 are implemented as requested, including identity/persistence in Pha
 | 2. Unified API/mock provider — implemented | Completion contract, validation, errors, provider boundary, deterministic mock, enable/disable switch | Unit/HTTP contract tests and local curl pass; model discovery and real adapters remain deferred |
 | 3. OpenAI integration — implemented | WebClient adapter, model aliases, environment credentials, timeouts, safe errors, no retries | Mapping/configuration tests and local HTTP-stub tests pass; live paid calls are not automated |
 | 4. Authentication/tenants — implemented | PostgreSQL/Flyway, tenant/key services, HMAC digests, stateless security, local provisioning | PostgreSQL integration tests verify migrations, authorization, isolation, expiry, revocation, and rotation |
-| 5. Routing/resilience | Add second provider, model policies, health selection, deadlines, breakers, bounded retries/fallback | Provider substitution requires no API changes; timeout, ambiguity, fallback, and concurrency tests pass |
+| 5. Distributed rate limiting — implemented | Redis/Lettuce, atomic Lua tenant token buckets, configurable policies and outage handling | Refill, tenant isolation, two-instance concurrent HTTP limits, 429/Retry-After, and outage tests pass |
 | 6. Response caching | Add opt-in policy, TTLs, isolation, and configuration-sensitive keys | Hit/miss, expiry, option sensitivity, invalidation, isolation, and cache outage tests pass |
 | 7. Production hardening | Add metrics/traces, usage metadata, secret redaction, resource limits, graceful shutdown | Failures diagnosable; sensitive-data checks pass; load baseline and proposed SLOs reviewed |
 | 8. Deployment/scale validation | Add Docker/local services, CI, runbooks, migrations/rollback, multi-replica exercises | Staging rollout, scale, dependency recovery, backup restoration, and rollback verified |
 
-Authentication is now mandatory in local and production web modes. Production still requires infrastructure TLS, controlled management/database access, secret distribution, backups, and deployment hardening. Redis-based rate limiting remains deferred.
+Authentication is now mandatory in local and production web modes. Production still requires infrastructure TLS, controlled management/database access, secret distribution, backups, and deployment hardening. Distributed tenant rate limiting is enforced by default. Policy routing/resilience remains deferred.
 
 ## 9. Local setup, build, run, and test
 
-Required: JDK 21, Git, and network access to Maven Central on the first wrapper/build invocation. A separate Maven installation is unnecessary. Compose is optional for runtime PostgreSQL setup, but a working Docker daemon is required for Testcontainers integration tests. PostgreSQL is required at runtime. No Redis is needed. Real OpenAI credentials are optional. Configure `DB_PASSWORD` and `GATEWAY_API_KEY_PEPPER` before startup and provision a gateway key as described below.
+Required: JDK 21, Git, and network access to Maven Central on the first wrapper/build invocation. A separate Maven installation is unnecessary. Compose is optional for runtime PostgreSQL setup, but a working Docker daemon is required for Testcontainers integration tests. PostgreSQL and Redis 7+ are required at runtime under the default fail-closed policy. Real OpenAI credentials are optional. Configure `DB_PASSWORD` and `GATEWAY_API_KEY_PEPPER` before startup and provision a gateway key as described below.
 
 On macOS, select JDK 21 explicitly when several JDKs are installed:
 
@@ -264,6 +266,14 @@ java -jar target/Distriubuted_AI_Gateway-1.0-SNAPSHOT.jar
 | `DB_USERNAME` | `gateway` | Database role |
 | `DB_PASSWORD` | empty | Required operator-supplied database password |
 | `GATEWAY_API_KEY_PEPPER` | empty | Required separate high-entropy secret, at least 32 bytes |
+| `REDIS_HOST` / `REDIS_PORT` | `127.0.0.1` / `6379` | Redis endpoint; Compose gateway uses service name `redis` |
+| `REDIS_PASSWORD` | empty | Optional externally supplied Redis password; local Compose uses loopback without authentication |
+| `REDIS_CONNECT_TIMEOUT` / `REDIS_TIMEOUT` | `1s` / `1s` | Connection and command timeouts |
+| `RATE_LIMIT_CAPACITY` | `60` | Maximum burst in request tokens |
+| `RATE_LIMIT_REFILL_RATE` | `1` | Request tokens refilled per second; fractional rates supported |
+| `RATE_LIMIT_REQUEST_COST` | `1` | Tokens charged per authorized chat attempt |
+| `RATE_LIMIT_OUTAGE_POLICY` | `FAIL_CLOSED` | `FAIL_CLOSED` returns 503; explicit `FAIL_OPEN` bypasses unavailable limiter |
+| `DB_PORT` | `5432` | Compose PostgreSQL host port; match host application's `DB_URL` when overridden |
 | `MOCK_PROVIDER_ENABLED` | `true` | Enable mock adapter; false makes `mock-chat` return 503 |
 | `OPENAI_ENABLED` | `false` | Register the real provider and its WebClient |
 | `OPENAI_API_KEY` | empty | Server-side Bearer credential, read from the environment |
@@ -299,7 +309,7 @@ Set a database password and a separate persistent HMAC pepper in your trusted en
 With `DB_PASSWORD` and `GATEWAY_API_KEY_PEPPER` exported (or populated in ignored `.env` and exported):
 
 ```sh
-docker compose up -d postgres
+docker compose up -d postgres redis
 ./mvnw clean verify
 mkdir -m 700 .gateway-keys
 ```
@@ -360,6 +370,57 @@ Only `GET /actuator/health` is public. `POST /v1/chat/completions` requires `CHA
 
 Tenant identity comes from the validated key, never JSON or `X-Tenant-ID`. Tenant-scoped key queries require both tenant UUID and key UUID; listings exclude digest/plaintext fields. There are no tenant-data HTTP routes in this phase and no controller returns JPA entities. See [architecture documentation](docs/architecture.md) for boundaries and migration details.
 
+### Distributed tenant rate limiting (Phase 5)
+
+The security chain authenticates and authorizes the request, then `RateLimitFilter` consumes the authenticated principal's tenant bucket before MVC/controller/provider execution. Only `POST /v1/chat/completions` is limited. Missing/invalid/revoked keys, suspended tenants, and keys without `CHAT_COMPLETIONS` never consume bucket tokens. `X-Tenant-ID` and JSON tenant values cannot select a bucket. All keys belonging to a tenant share its limit; different tenants have independent buckets. Health is public and bypasses rate limiting.
+
+Each tenant uses Redis hash `gateway:ratelimit:v1:{<tenant UUID>}:chat`, containing `tokens` and `updated_at` in milliseconds. One atomic Lua script uses Redis `TIME`, refills by elapsed seconds times refill rate, caps at capacity, deducts the request cost only when allowed, and persists state with `PEXPIRE`. Its result is `[allowed (0/1), floor(remaining tokens), ceil(retry seconds), ceil(seconds until full)]`. New buckets start full. TTL is at least one second and never earlier than full refill; idle buckets can safely expire. A backward Redis clock step earns no tokens and retains the previous timestamp until server time catches up. Redis 7+ effects replication supports server-time writes; application clocks are not used.
+
+Operator-controlled policy overrides use authenticated tenant UUIDs in Spring configuration:
+
+```yaml
+gateway:
+  rate-limit:
+    outage-policy: FAIL_CLOSED
+    defaults:
+      capacity: 60
+      refill-rate: 1
+      request-cost: 1
+    tenants:
+      "11111111-1111-1111-1111-111111111111":
+        capacity: 10
+        refill-rate: 0.5
+        request-cost: 2
+```
+
+Omitted fields use defaults of 60/1/1; each tenant override is a complete policy rather than an inheritance of custom global values. Capacity/cost must be positive integers, cost must not exceed capacity, refill rate must be finite and positive, capacity/rate are bounded at 1,000,000, and full refill must take at most one day. Invalid policies or tenant UUIDs fail web startup. No policy database, admin HTTP endpoint, or live policy refresh is introduced. Deploy identical policies, Redis database, and key namespace on all replicas; changing policies during a mixed-version rollout can produce inconsistent limits. Existing tokens are capped to the policy capacity on the next access, without granting a fresh burst.
+
+Rate-limited responses return sanitized `application/problem+json` with code `rate_limit_exceeded` and `Retry-After` as a positive whole number of seconds until enough tokens would exist for one request. Allowed and denied checks return `X-RateLimit-Limit` (capacity), `X-RateLimit-Remaining` (whole request tokens), and `X-RateLimit-Reset` (relative seconds until full, not an epoch timestamp). These headers describe the instant of the check; concurrent traffic can spend tokens immediately afterward. Waiting does not reserve tokens.
+
+The default in every profile, including production, is **FAIL_CLOSED**: Redis connection, timeout, or script failures return sanitized `503 rate_limit_unavailable` and never invoke a provider. Operators can explicitly select **FAIL_OPEN** to prioritize availability; requests then proceed without rate-limit headers and distributed enforcement cannot be guaranteed during the outage. There is no local fallback counter and no application retry. A timed-out script may already have charged tokens; replay can charge again. Health includes Redis dependency status but reveals no connection details.
+
+For a small local burst demonstration, stop any existing gateway, export the trusted `.env` as described above, then run:
+
+```sh
+docker compose up -d postgres redis
+RATE_LIMIT_CAPACITY=2 RATE_LIMIT_REFILL_RATE=0.1 ./mvnw spring-boot:run
+```
+
+With a provisioned gateway key in another terminal, make three quick requests:
+
+```sh
+for attempt in 1 2 3; do
+  curl -i http://127.0.0.1:8080/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer $GATEWAY_API_KEY" \
+    -d '{"model":"mock-chat","messages":[{"role":"user","content":"Hello"}]}'
+done
+```
+
+The first two requests succeed and the third returns 429 with `Retry-After`; one request token refills every ten seconds. After the indicated delay, try again. This uses the mock provider and makes no paid OpenAI calls.
+
+Limitations: request tokens count authorized attempts, **not LLM input/output tokens**. Controller validation errors, unknown models, and provider errors still consume tokens; tokens are not refunded. This is a request-rate limit, not a bound on concurrent in-flight work or billing. Redis loss, eviction, failover with lost writes, or operator deletion can reset buckets and permit another burst. Local Compose enables AOF, a persistent volume, and `noeviction`, but does not provide production HA, TLS, or authenticated Redis. Protect Redis at the infrastructure boundary; configure external credentials/TLS as needed. Namespace Redis separately for independent environments, and do not treat rate limiting as a security or billing ledger. Caching, usage billing, and routing policies remain deferred.
+
 ### Running the real OpenAI provider
 
 Export `OPENAI_API_KEY` through your trusted local environment or edit your ignored `.env` copy (leave the committed example empty). Spring does not load `.env` automatically. With the key already exported:
@@ -405,7 +466,7 @@ Compose forwards the same OpenAI environment settings, including the key at runt
 ./mvnw clean verify  # Also runs Failsafe HTTP integration tests ending in IT
 ```
 
-Tests require a working Docker daemon and automatically start a disposable PostgreSQL container; no operator credentials or paid/live OpenAI calls are needed. The test profile disables OpenAI regardless of ambient `OPENAI_ENABLED`; adapter tests use only a loopback JDK HTTP server and a fake credential. HTTP integration tests start the real application on an ephemeral port under the `test` profile. Reports are written to ignored `target/surefire-reports` and `target/failsafe-reports`.
+Tests require a working Docker daemon and automatically start disposable PostgreSQL and Redis containers; no operator credentials or paid/live OpenAI calls are needed. The test profile disables OpenAI regardless of ambient `OPENAI_ENABLED`; adapter tests use only a loopback JDK HTTP server and a fake credential. HTTP integration tests start the real application on an ephemeral port under the `test` profile. Reports are written to ignored `target/surefire-reports` and `target/failsafe-reports`.
 
 ### Optional Docker execution
 
@@ -415,7 +476,7 @@ curl --fail http://127.0.0.1:8080/actuator/health
 docker compose down
 ```
 
-Compose runs the gateway and PostgreSQL and binds published ports to host loopback. Its `.env` support comes from Compose, independently of Spring Boot. Run `./mvnw clean verify` on the host/CI before building. Docker builds run unit tests via `clean package`, because the build stage has no Docker daemon for Testcontainers, then copy the executable JAR into a Java 21 runtime image running as a numeric non-root user. Docker execution must be verified separately from a Maven build.
+Compose runs the gateway, PostgreSQL, and Redis and binds published ports to host loopback. Its `.env` support comes from Compose, independently of Spring Boot. Run `./mvnw clean verify` on the host/CI before building. Docker builds run unit tests via `clean package`, because the build stage has no Docker daemon for Testcontainers, then copy the executable JAR into a Java 21 runtime image running as a numeric non-root user. Docker execution must be verified separately from a Maven build.
 
 ## 10. Testing and deployment strategy
 
@@ -429,7 +490,7 @@ Use incremental test-driven development and run tests after application changes.
 - **Load/multi-replica tests:** Measure gateway overhead and verify shared quotas, concurrency bounds, pools, and configuration freshness with controlled upstreams.
 - **Security/recovery tests:** Cover rotation/revocation, secret redaction, oversized requests, authorization, shutdown, and dependency recovery.
 
-Implemented tests check safe configuration defaults, production logging and external overrides, real-HTTP health, management endpoint exposure, and framework Problem Details. Phase 2 tests cover deterministic completions, validation, unknown models, truncation, safe failure mapping, and disabled-provider startup. Phase 3 tests cover wire mapping, model/timeout configuration, Bearer headers, local HTTP success, 400/401/403/429/500/503 errors, malformed/empty responses, missing credentials, response/overall timeouts, refused connections, and connection resets without retry. Phase 4 adds real PostgreSQL migration/schema validation, key lifecycle, digest-only storage, permissions, tenant isolation, concurrent context cleanup, safe error mapping, and local provisioning tests. Additional rate-limit, load, and deployment-hardening tests remain planned.
+Implemented tests check safe configuration defaults, production logging and external overrides, real-HTTP health, management endpoint exposure, and framework Problem Details. Phase 2 tests cover deterministic completions, validation, unknown models, truncation, safe failure mapping, and disabled-provider startup. Phase 3 tests cover wire mapping, model/timeout configuration, Bearer headers, local HTTP success, 400/401/403/429/500/503 errors, malformed/empty responses, missing credentials, response/overall timeouts, refused connections, and connection resets without retry. Phase 4 adds real PostgreSQL migration/schema validation, key lifecycle, digest-only storage, permissions, tenant isolation, concurrent context cleanup, safe error mapping, and local provisioning tests. Phase 5 adds Redis token bucket refill/cost/TTL tests, per-tenant isolation, authorization before consumption, rejected-provider checks, actual Redis outages, and concurrent HTTP requests across two gateway instances. Broader load and deployment-hardening tests remain planned.
 
 ### Deployment
 

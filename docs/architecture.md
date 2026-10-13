@@ -1,13 +1,16 @@
-# Implemented architecture (Phases 1–4)
+# Implemented architecture (Phases 1–5)
 
-Java 21, Spring Boot MVC modular monolith. Capability packages own business rules and infrastructure. No Redis, rate limiting, caching, Kafka, usage billing, OAuth, or circuit breakers are implemented.
+Java 21, Spring Boot MVC modular monolith. Capability packages own business rules and infrastructure. Redis-backed tenant rate limiting is implemented. Caching, Kafka, usage billing, OAuth, and circuit breakers remain unimplemented.
 
 ```mermaid
 flowchart LR
     Client --> Security[Spring Security / Bearer key filter]
     Security --> Auth[ApiKeyAuthenticator]
     Auth --> DB[(PostgreSQL tenants / api_keys)]
-    Security --> Controller[ChatCompletionController]
+    Security --> Authorization[Route permission check]
+    Authorization --> Limit[RateLimitFilter]
+    Limit --> Redis[(Redis atomic Lua bucket)]
+    Limit --> Controller[ChatCompletionController]
     Controller --> Service[GatewayService]
     Service --> Selector[ProviderSelector]
     Selector --> Boundary[LLMProvider]
@@ -37,4 +40,14 @@ Controller/service/provider interface and JSON payloads remain unchanged. The se
 
 ## Verification and operations
 
-Surefire runs unit tests; Failsafe runs HTTP and PostgreSQL tests against Testcontainers PostgreSQL 16. Docker is required; integration tests do not silently skip when unavailable. Flyway runs on a fresh container and JPA validates the resulting schema. CI runs the full suite. Docker image construction runs unit tests only because a Docker build stage lacks a Testcontainers daemon; full verification must precede packaging on the host/CI. Compose supplies PostgreSQL and loopback-only ports. Production still requires TLS, protected secrets/database access, backups, and deployment hardening.
+Surefire runs unit tests; Failsafe runs HTTP and PostgreSQL tests against Testcontainers PostgreSQL 16 and Redis 7.4. Docker is required; integration tests do not silently skip when unavailable. Flyway runs on a fresh container and JPA validates the resulting schema. CI runs the full suite. Docker image construction runs unit tests only because a Docker build stage lacks a Testcontainers daemon; full verification must precede packaging on the host/CI. Compose supplies PostgreSQL and Redis and loopback-only ports. Production still requires TLS, protected secrets/database access, backups, and deployment hardening.
+
+## Distributed rate limiting
+
+The `ratelimit` capability owns validated `RateLimitProperties`, the Redis adapter `RedisTokenBucket`, and `RateLimitFilter`. The security configuration constructs the filter only inside Spring Security, after `AuthorizationFilter`; it is not auto-registered as a servlet filter. Authentication and route permissions must succeed before Redis consumption. Controller, provider, and routing code remain unchanged.
+
+The Redis hash `gateway:ratelimit:v1:{tenant UUID}:chat` shares one request bucket across keys and replicas for the principal's tenant. Lua loads tokens/timestamp, uses Redis TIME, refills with fractional precision, caps to capacity, conditionally deducts cost, and persists with a TTL no shorter than full refill. Backward server-clock steps retain the previous timestamp and extend TTL/retry estimates. The one-key contract works with Redis Cluster hash slots, although the supplied local configuration uses standalone Redis 7+. Arguments are capacity/refill-per-second/cost; result is allowed/whole-remaining/retry-seconds/full-refill-seconds. No application-clock input, local counters, or separate read/write race exists.
+
+Defaults are capacity 60, refill 1 token/second, cost 1, FAIL_CLOSED. UUID-keyed tenant overrides are deployment configuration and must match across replicas. Failure returns 503 without provider invocation; explicit FAIL_OPEN bypasses enforcement without claiming headers. Denials return 429 Problem Details and Retry-After, while successful checks and denials expose X-RateLimit-Limit/Remaining/Reset (relative full-refill seconds). Charge is per authorized attempt before validation, with no refund or automatic retry. Redis state loss can reset allowances; AOF/noeviction reduces but does not eliminate that risk.
+
+Tests include two real application contexts sharing PostgreSQL/Redis and concurrent HTTP traffic; exactly the configured burst succeeds. They also cover request cost, fractional refill, TTL, tenant/key sharing and isolation, invalid/unpermitted keys, provider non-invocation, configuration validation, and a stopped isolated Redis container under both outage policies. No real OpenAI requests occur. See README for operational settings and local curl examples.

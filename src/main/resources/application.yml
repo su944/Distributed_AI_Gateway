@@ -1,4 +1,13 @@
 spring:
+  data:
+    redis:
+      repositories:
+        enabled: false
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      connect-timeout: ${REDIS_CONNECT_TIMEOUT:1s}
+      timeout: ${REDIS_TIMEOUT:1s}
   datasource:
     url: ${DB_URL:jdbc:postgresql://127.0.0.1:5432/gateway}
     username: ${DB_USERNAME:gateway}
@@ -23,6 +32,12 @@ spring:
       enabled: true
 
 gateway:
+  rate-limit:
+    outage-policy: ${RATE_LIMIT_OUTAGE_POLICY:FAIL_CLOSED}
+    defaults:
+      capacity: ${RATE_LIMIT_CAPACITY:60}
+      refill-rate: ${RATE_LIMIT_REFILL_RATE:1}
+      request-cost: ${RATE_LIMIT_REQUEST_COST:1}
   mock:
     enabled: ${MOCK_PROVIDER_ENABLED:true}
   openai:

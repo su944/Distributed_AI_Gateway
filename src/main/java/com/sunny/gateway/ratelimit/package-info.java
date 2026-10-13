@@ -1,4 +1,2 @@
-/**
- * Tenant-scoped request-rate enforcement; rate limiting is planned.
- */
+/** Distributed tenant request rate limiting with Redis token buckets. */
 package com.sunny.gateway.ratelimit;
