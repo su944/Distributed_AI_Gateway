@@ -4,9 +4,9 @@ A production-oriented gateway providing a consistent API over multiple AI provid
 
 ## Current status
 
-**Phases 1–5 are implemented: foundation, unified mock API, optional OpenAI adapter, PostgreSQL-backed tenant API-key authentication, and Redis-backed distributed tenant rate limiting.** The application uses Java 21, Spring Boot 3.5.16, and Maven. It includes capability package documentation, profile/environment configuration, minimal Actuator health, framework error conventions, JUnit 5 unit and HTTP integration tests, a Maven wrapper, CI, and optional application-only Docker execution.
+**Phases 1–6 are implemented: foundation, unified mock API, optional OpenAI adapter, PostgreSQL-backed tenant API-key authentication, Redis-backed distributed tenant rate limiting, and configurable tenant-aware model routing.** The application uses Java 21, Spring Boot 3.5.16, and Maven. It includes capability package documentation, profile/environment configuration, minimal Actuator health, framework error conventions, JUnit 5 unit and HTTP integration tests, a Maven wrapper, CI, and optional application-only Docker execution.
 
-`POST /v1/chat/completions`, Bean Validation, provider selection, sanitized Problem Details, and mock enable/disable configuration are implemented. The OpenAI adapter uses Spring WebClient with configurable model aliases, deadlines, sanitized errors, and no automatic retries. Tenant/key persistence and stateless API-key authentication are implemented. Redis token buckets enforce per-tenant request limits across replicas. Model discovery, policy routing, caching, and usage billing remain planned. All chat requests now require an issued gateway key; PostgreSQL, Redis, and a separate gateway HMAC pepper are required under the default fail-closed policy. Mock chat needs no OpenAI credentials.
+`POST /v1/chat/completions`, Bean Validation, provider selection, sanitized Problem Details, and mock enable/disable configuration are implemented. The OpenAI adapter uses Spring WebClient with configurable model aliases, deadlines, sanitized errors, and no automatic retries. Tenant/key persistence and stateless API-key authentication are implemented. Redis token buckets enforce per-tenant request limits across replicas. Priority and weighted random routing apply tenant model/provider allow-lists. Model discovery, caching, and usage billing remain planned. All chat requests now require an issued gateway key; PostgreSQL, Redis, and a separate gateway HMAC pepper are required under the default fail-closed policy. Mock chat needs no OpenAI credentials.
 
 ## 1. Overview and problem statement
 
@@ -109,7 +109,7 @@ flowchart LR
 - **Persistence:** Repository interfaces and storage implementations.
 - **Observability:** Sanitized usage events, correlation, metrics, and traces.
 
-The implemented root is `com.sunny.gateway`, with documented capability packages: `gateway`, `provider`, `routing`, `authentication`, `ratelimit`, `tenant`, `usage`, `config`, and `common`. The gateway API/orchestrator, provider interface, mock/OpenAI adapters, and simple provider selector are implemented; tenant and authentication are also implemented; other capability implementations remain planned. These packages are code boundaries within one deployable application. Domain/application code depends on interfaces implemented by infrastructure adapters. Modules communicate through public contracts rather than accessing implementation details.
+The implemented root is `com.sunny.gateway`, with documented capability packages: `gateway`, `provider`, `routing`, `authentication`, `ratelimit`, `tenant`, `usage`, `config`, and `common`. The gateway API/orchestrator, provider interface, mock/OpenAI adapters, and configurable routing engine are implemented; tenant and authentication are also implemented; other capability implementations remain planned. These packages are code boundaries within one deployable application. Domain/application code depends on interfaces implemented by infrastructure adapters. Modules communicate through public contracts rather than accessing implementation details.
 
 ### Request flow and failure policy
 
@@ -132,7 +132,7 @@ Horizontal scaling adds replicas behind the load balancer. Verify distributed qu
 
 ### Implemented: `POST /v1/chat/completions`
 
-The Phase 2 API is a small synchronous text-chat contract, not full OpenAI compatibility. It requires `Authorization: Bearer <gateway-api-key>` and returns one assistant choice. `mock-chat` requires no OpenAI credentials; `openai-chat` is available when OpenAI is enabled and configured. `GET /v1/models`, streaming, request correlation headers, additional providers, and the broader future contracts remain planned.
+The Phase 2 API is a small synchronous text-chat contract, not full OpenAI compatibility. It requires `Authorization: Bearer <gateway-api-key>` and returns one assistant choice. `mock-chat` requires no OpenAI credentials; `openai-chat` is available when OpenAI is enabled and configured. Server-generated `X-Request-ID` correlation headers are available. `GET /v1/models`, streaming, additional providers, and the broader future contracts remain planned.
 
 ```sh
 curl --fail-with-body http://127.0.0.1:8080/v1/chat/completions \
@@ -178,13 +178,14 @@ All errors use Spring MVC Problem Details (`application/problem+json`). Domain a
 | Status | Code | Meaning |
 | --- | --- | --- |
 | `401` | `unauthorized` | Missing, malformed, invalid, revoked, or expired gateway key; includes `WWW-Authenticate: Bearer` |
-| `403` | `forbidden` | Suspended tenant, missing permission, or route denied by policy |
+| `403` | `forbidden` | Suspended tenant, missing permission, or HTTP route denied by policy |
+| `403` | `model_forbidden` | Tenant model/provider allow-list denies access |
 | `429` | `rate_limit_exceeded` | Tenant bucket exhausted; includes `Retry-After` |
 | `503` | `rate_limit_unavailable` | Redis unavailable under fail-closed policy |
 | `503` | `authentication_unavailable` | Authentication database is unavailable; fail closed |
 | `400` | `invalid_request` | Invalid messages/options, malformed JSON, or unknown fields |
-| `400` | `unsupported_model` | No enabled provider supports the requested alias (including OpenAI aliases when disabled) |
-| `503` | `provider_unavailable` | Mock disabled, or OpenAI returns 429/503 |
+| `400` | `unsupported_model` | Alias is absent from the registry (legacy OpenAI aliases are absent when OpenAI is disabled) |
+| `503` | `provider_unavailable` | Registered model has no enabled eligible candidate, or OpenAI returns 429/503 |
 | `503` | `provider_credentials_missing` | Enabled OpenAI selected without `OPENAI_API_KEY` |
 | `503` | `provider_authentication_error` | OpenAI returns 401/403; this is provider authentication, not client authentication |
 | `504` | `provider_timeout` | Connection, response-read, or overall deadline exceeded |
@@ -195,7 +196,7 @@ The mock does not expose a client-controlled failure trigger. Tests substitute a
 
 ### Implemented class boundaries
 
-`ChatCompletionController` validates HTTP requests and delegates to `GatewayService`. The service asks `routing.ProviderSelector` for the first registered provider supporting the model, then calls `provider.LLMProvider`. `MockLLMProvider` implements that boundary and is conditionally registered. Request/message/response records define the client contract; `GatewayExceptionHandler` maps gateway, adapter, validation, and parsing failures. `provider.openai` owns configuration, WebClient transport, wire DTOs, and mapping. No routing policy engine or speculative storage abstractions are introduced.
+`ChatCompletionController` validates HTTP requests and delegates to `GatewayService`. The service asks `routing.RoutingService` to authorize the model and select one provider/upstream model, then calls `provider.LLMProvider` once. `MockLLMProvider` implements that boundary and is conditionally registered. Request/message/response records define the client contract; `GatewayExceptionHandler` maps gateway, adapter, validation, and parsing failures. `provider.openai` owns configuration, WebClient transport, wire DTOs, and mapping. The immutable routing registry and strategy implementations are separate from vendor transport and authentication.
 
 ### Operational endpoints
 
@@ -205,7 +206,7 @@ Spring MVC Problem Details is enabled for framework errors, such as an unknown r
 
 ## 8. Eight-phase implementation roadmap
 
-Phases 1–5 are implemented as requested, including identity/persistence in Phase 4 and distributed token buckets in Phase 5; model discovery and later capability phases remain **not started**. Implement one capability at a time using failing tests, implementation, and refactoring. Obtain dependency approval before adding libraries.
+Phases 1–6 are implemented as requested, including identity/persistence in Phase 4, distributed token buckets in Phase 5, and model routing in Phase 6; model discovery and later capability phases remain **not started**. Implement one capability at a time using failing tests, implementation, and refactoring. Obtain dependency approval before adding libraries.
 
 | Phase | Scope | Exit criteria |
 | --- | --- | --- |
@@ -214,11 +215,11 @@ Phases 1–5 are implemented as requested, including identity/persistence in Pha
 | 3. OpenAI integration — implemented | WebClient adapter, model aliases, environment credentials, timeouts, safe errors, no retries | Mapping/configuration tests and local HTTP-stub tests pass; live paid calls are not automated |
 | 4. Authentication/tenants — implemented | PostgreSQL/Flyway, tenant/key services, HMAC digests, stateless security, local provisioning | PostgreSQL integration tests verify migrations, authorization, isolation, expiry, revocation, and rotation |
 | 5. Distributed rate limiting — implemented | Redis/Lettuce, atomic Lua tenant token buckets, configurable policies and outage handling | Refill, tenant isolation, two-instance concurrent HTTP limits, 429/Retry-After, and outage tests pass |
-| 6. Response caching | Add opt-in policy, TTLs, isolation, and configuration-sensitive keys | Hit/miss, expiry, option sensitivity, invalidation, isolation, and cache outage tests pass |
+| 6. Model routing — implemented | Configurable candidate registry, priority/weighted strategies, tenant allow-lists, routing metrics and correlation | Selection, distribution, tenant policies, error contracts, and single-attempt stub-provider tests pass |
 | 7. Production hardening | Add metrics/traces, usage metadata, secret redaction, resource limits, graceful shutdown | Failures diagnosable; sensitive-data checks pass; load baseline and proposed SLOs reviewed |
 | 8. Deployment/scale validation | Add Docker/local services, CI, runbooks, migrations/rollback, multi-replica exercises | Staging rollout, scale, dependency recovery, backup restoration, and rollback verified |
 
-Authentication is now mandatory in local and production web modes. Production still requires infrastructure TLS, controlled management/database access, secret distribution, backups, and deployment hardening. Distributed tenant rate limiting is enforced by default. Policy routing/resilience remains deferred.
+Authentication is now mandatory in local and production web modes. Production still requires infrastructure TLS, controlled management/database access, secret distribution, backups, and deployment hardening. Distributed tenant rate limiting is enforced by default. Priority/weighted routing is implemented; retries, fallback, dynamic health routing, and circuit breakers remain deferred.
 
 ## 9. Local setup, build, run, and test
 
@@ -419,7 +420,67 @@ done
 
 The first two requests succeed and the third returns 429 with `Retry-After`; one request token refills every ten seconds. After the indicated delay, try again. This uses the mock provider and makes no paid OpenAI calls.
 
-Limitations: request tokens count authorized attempts, **not LLM input/output tokens**. Controller validation errors, unknown models, and provider errors still consume tokens; tokens are not refunded. This is a request-rate limit, not a bound on concurrent in-flight work or billing. Redis loss, eviction, failover with lost writes, or operator deletion can reset buckets and permit another burst. Local Compose enables AOF, a persistent volume, and `noeviction`, but does not provide production HA, TLS, or authenticated Redis. Protect Redis at the infrastructure boundary; configure external credentials/TLS as needed. Namespace Redis separately for independent environments, and do not treat rate limiting as a security or billing ledger. Caching, usage billing, and routing policies remain deferred.
+Limitations: request tokens count authorized attempts, **not LLM input/output tokens**. Controller validation errors, unknown models, and provider errors still consume tokens; tokens are not refunded. This is a request-rate limit, not a bound on concurrent in-flight work or billing. Redis loss, eviction, failover with lost writes, or operator deletion can reset buckets and permit another burst. Local Compose enables AOF, a persistent volume, and `noeviction`, but does not provide production HA, TLS, or authenticated Redis. Protect Redis at the infrastructure boundary; configure external credentials/TLS as needed. Namespace Redis separately for independent environments, and do not treat rate limiting as a security or billing ledger. Caching and usage billing remain deferred. Routing authorization failures also consume the earlier request-rate allowance.
+
+### Intelligent model routing (Phase 6)
+
+The implemented flow is authentication → HTTP permission → Redis allowance → MVC validation → tenant model/provider policy → candidate selection → **one provider attempt**. `GatewayService` uses `RoutingService` and keeps the requested gateway alias in the public response, even when the selected upstream model or returned vendor model differs. Request/response JSON is unchanged. No automatic retry, fallback, circuit breaker, health selection, price discovery, or caching is implemented.
+
+The immutable registry imports `mock-chat → mock/mock-chat` and, only when OpenAI is enabled, the existing `gateway.openai.models` aliases. `OPENAI_CHAT_MODEL` continues to work. Explicit `gateway.routing.models` entries add aliases or replace the imported entry for the same alias. An alias has a strategy, enabled flag, and 1–100 candidates. Each candidate has `provider-id`, `upstream-model-id`, nonnegative `priority`, positive integer `weight`, and `enabled` (default true). Weight defaults to 1 and priority to 0. Strategies default to PRIORITY. Disabling `gateway.mock.enabled` or `gateway.openai.enabled` removes that adapter from eligibility, without invalidating an explicit candidate for that known provider. Missing OpenAI credentials still produce the existing sanitized 503 when that adapter is selected; credentials are never read by routing.
+
+A sample with both provider candidates is shown below. Selecting OpenAI can make a paid request; automated tests use local stubs only. Enable/configure OpenAI separately if you want it eligible.
+
+```yaml
+gateway:
+  routing:
+    models:
+      team-chat:
+        strategy: PRIORITY
+        enabled: true
+        candidates:
+          - provider-id: mock
+            upstream-model-id: mock-chat
+            priority: 0
+            weight: 1
+            enabled: true
+          - provider-id: openai
+            upstream-model-id: gpt-4o-mini
+            priority: 10
+            weight: 3
+            enabled: true
+    default-policy:
+      allowed-models: [mock-chat, team-chat]
+      allowed-providers: [mock, openai]
+    tenants:
+      "11111111-1111-1111-1111-111111111111":
+        allowed-models: [team-chat]
+        allowed-providers: [mock]
+```
+
+**PRIORITY** uses lower numbers first. Ties compare provider ID and then upstream model ID lexicographically, so list order cannot change the winner. It is predictable, but does not balance traffic. **WEIGHTED_RANDOM** ignores priority and selects independently in proportion to eligible candidate weights: weights 1 and 3 yield approximately 25% and 75% over many requests. Short bursts need not match those percentages, and there is no cross-replica scheduling or sticky selection. `RandomSource` supplies a thread-safe uniform bounded integer by default and is replaceable in tests. Selection happens after disabled/unavailable candidates and disallowed providers are removed; weights are renormalized over that eligible set. Changing the sample strategy to WEIGHTED_RANDOM uses its weights.
+
+Tenant UUID comes only from `GatewayPrincipal` in Spring Security. Client tenant headers/fields do not grant access. A tenant entry completely replaces the default policy; both alias and selected provider must be explicitly allowed. Empty/missing allow-list fields deny that dimension. When no default policy is configured, authenticated CHAT_COMPLETIONS keys retain access only to legacy `mock-chat` and enabled legacy OpenAI aliases, through built-in `mock`/`openai` providers. New aliases/providers require an explicit policy grant; registering a new alias alone does not grant access. Wildcards are unsupported. Policy references must name registered aliases and known provider IDs. Match routing/policy configuration across replicas; changes require restart and are not persisted in PostgreSQL.
+
+Compatibility: the external JSON and legacy OpenAI configuration remain supported. The internal provider interface gains `id()`, `supportsUpstream(...)`, and `complete(request, upstreamModel)`, while built-in legacy methods remain available. Aliases are 1–128 identifier characters (`A–Z`, `a–z`, digits, `.`, `_`, `:`, `-`, starting with a letter/digit); provider IDs are lowercase letters/digits/hyphens starting with a letter; upstream IDs are 1–256 identifier characters with `/` also allowed. Invalid IDs, negative priorities, weights outside 1..1,000,000,000, duplicate provider/model candidates, duplicate adapter IDs, unknown provider/policy references, unsupported mock models, or missing candidates fail startup with a routing diagnostic. Upstream validity for OpenAI means syntactic validity only, not live vendor model availability or feature compatibility.
+
+Unknown routing property names also fail startup, so misspellings such as `weigth` cannot silently use a default. Spring binding diagnostics identify the unbound property path.
+
+Unknown aliases return existing `400 unsupported_model`. Alias/provider access denied by policy returns `403 model_forbidden`. Authorized aliases with no enabled candidate/adapter return existing `503 provider_unavailable`. Legacy OpenAI aliases remain unknown when OpenAI is disabled, unless explicitly registered. Known enabled adapters retain their existing credential/timeout/error mapping. Sanitized errors do not include candidate configuration, credentials, or prompts.
+
+Each selected attempt increments `gateway.routing.decisions` tagged only by configured provider ID and strategy. Counters count selections, including attempts that later fail, and omit model aliases, tenant IDs, keys, prompts, and correlation IDs. Management exposure remains health-only. `RoutingDecision` is internal request metadata; it is not added to JSON or provider-selection response headers. A server-generated UUID is returned as `X-Request-ID` on HTTP responses and stored in request-local MDC. Client request-ID values are ignored. Structured routing logs include `correlation_id`, `provider`, `upstream_model`, and `strategy`; production uses the existing ECS JSON format. MDC is cleared/restored after each request, including failures. Logs never include messages, keys, or credentials. See [Spring Boot structured logging](https://docs.spring.io/spring-boot/3.5/reference/features/logging.html) for the MDC/key-value format.
+
+With the sample configured, call the gateway with a provisioned key:
+
+```sh
+curl -i http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -d '{"model":"team-chat","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+For the sample's PRIORITY strategy, enabled mock wins and the response model is `team-chat`. Provider errors do not trigger selection of another candidate. Rate limiting occurs earlier, so validation/routing denials and provider failures still consume request tokens.
+
+To add a provider, implement `LLMProvider.id()`, `supportsUpstream(...)`, and `complete(request, upstreamModel)` in its capability-owned adapter and register it as a Spring bean with a unique stable provider ID. Keep credentials/HTTP mapping/error sanitization inside the adapter, preserve normalized usage/choices, and avoid automatic retries. Register candidates using that ID and grant aliases/providers in tenant/default policy; add deterministic unit and local HTTP-stub tests before using live credentials. Only built-in mock/openai IDs are known when their conditional adapters are absent; a new provider ID must have a registered adapter at startup. New strategies implement `RoutingStrategy` and declare their strategy enum value; every enum value must have exactly one registered implementation. No database schema or external dependency is needed for the supplied strategies.
 
 ### Running the real OpenAI provider
 
@@ -468,6 +529,8 @@ Compose forwards the same OpenAI environment settings, including the key at runt
 
 Tests require a working Docker daemon and automatically start disposable PostgreSQL and Redis containers; no operator credentials or paid/live OpenAI calls are needed. The test profile disables OpenAI regardless of ambient `OPENAI_ENABLED`; adapter tests use only a loopback JDK HTTP server and a fake credential. HTTP integration tests start the real application on an ephemeral port under the `test` profile. Reports are written to ignored `target/surefire-reports` and `target/failsafe-reports`.
 
+Phase 6 verification on October 13, 2026: `./mvnw --batch-mode --no-transfer-progress clean verify` on JDK 21 passed 59 unit tests and 60 integration tests, with no failures, errors, or skips. This includes application startup/health, authentication, tenant lifecycle, Redis limits/outages, routing, and loopback OpenAI adapter tests. The local sandbox blocked Mockito JVM attachment; the successful run used execution outside that sandbox. Standalone Docker image execution and hosted CI were not verified by this run.
+
 ### Optional Docker execution
 
 ```sh
@@ -490,7 +553,7 @@ Use incremental test-driven development and run tests after application changes.
 - **Load/multi-replica tests:** Measure gateway overhead and verify shared quotas, concurrency bounds, pools, and configuration freshness with controlled upstreams.
 - **Security/recovery tests:** Cover rotation/revocation, secret redaction, oversized requests, authorization, shutdown, and dependency recovery.
 
-Implemented tests check safe configuration defaults, production logging and external overrides, real-HTTP health, management endpoint exposure, and framework Problem Details. Phase 2 tests cover deterministic completions, validation, unknown models, truncation, safe failure mapping, and disabled-provider startup. Phase 3 tests cover wire mapping, model/timeout configuration, Bearer headers, local HTTP success, 400/401/403/429/500/503 errors, malformed/empty responses, missing credentials, response/overall timeouts, refused connections, and connection resets without retry. Phase 4 adds real PostgreSQL migration/schema validation, key lifecycle, digest-only storage, permissions, tenant isolation, concurrent context cleanup, safe error mapping, and local provisioning tests. Phase 5 adds Redis token bucket refill/cost/TTL tests, per-tenant isolation, authorization before consumption, rejected-provider checks, actual Redis outages, and concurrent HTTP requests across two gateway instances. Broader load and deployment-hardening tests remain planned.
+Implemented tests check safe configuration defaults, production logging and external overrides, real-HTTP health, management endpoint exposure, and framework Problem Details. Phase 2 tests cover deterministic completions, validation, unknown models, truncation, safe failure mapping, and disabled-provider startup. Phase 3 tests cover wire mapping, model/timeout configuration, Bearer headers, local HTTP success, 400/401/403/429/500/503 errors, malformed/empty responses, missing credentials, response/overall timeouts, refused connections, and connection resets without retry. Phase 4 adds real PostgreSQL migration/schema validation, key lifecycle, digest-only storage, permissions, tenant isolation, concurrent context cleanup, safe error mapping, and local provisioning tests. Phase 5 adds Redis token bucket refill/cost/TTL tests, per-tenant isolation, authorization before consumption, rejected-provider checks, actual Redis outages, and concurrent HTTP requests across two gateway instances. Phase 6 adds startup validation, priority/tie selection, seeded weighted distribution, tenant allow-lists, single-attempt guarantees, routing metrics, correlation cleanup, HTTP routing errors, and explicit upstream selection against a loopback OpenAI stub. Broader load and deployment-hardening tests remain planned.
 
 ### Deployment
 

@@ -32,6 +32,11 @@ spring:
       enabled: true
 
 gateway:
+  routing:
+    # Built-in mock and enabled legacy OpenAI aliases are imported by ModelRegistry.
+    # New aliases require explicit model grants in default-policy or tenants.
+    models: {}
+    tenants: {}
   rate-limit:
     outage-policy: ${RATE_LIMIT_OUTAGE_POLICY:FAIL_CLOSED}
     defaults:

@@ -4,7 +4,13 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sunny.gateway.gateway.*;
 import com.sunny.gateway.provider.ProviderException;
-import com.sunny.gateway.routing.ProviderSelector;
+import com.sunny.gateway.routing.*;
+import com.sunny.gateway.authentication.*;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import java.util.Set;
+import java.util.UUID;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -68,7 +74,7 @@ class OpenAIProviderIT {
         });
         server.start();
     }
-    @AfterEach void stopStub() { server.stop(0); executor.shutdownNow(); }
+    @AfterEach void stopStub() { server.stop(0); executor.shutdownNow(); SecurityContextHolder.clearContext(); }
 
     @Test void successfulHttpCallSendsBearerKeyAndProviderRequest() throws Exception {
         mvc(provider(Duration.ofSeconds(2), Duration.ofSeconds(3), KEY)).perform(post("/v1/chat/completions")
@@ -89,6 +95,27 @@ class OpenAIProviderIT {
         assertThat(outbound.at("/messages/1/role").asText()).isEqualTo("user");
         assertThat(outbound.at("/messages/2/role").asText()).isEqualTo("assistant");
         assertThat(body.get()).doesNotContain(KEY);
+        assertThat(requests.get()).isEqualTo(1);
+    }
+
+    @Test void explicitRoutingModelBypassesLegacyAliasMapAndPreservesGatewayAlias() throws Exception {
+        var provider = provider(Duration.ofSeconds(2), Duration.ofSeconds(3), KEY);
+        SecurityContextHolder.getContext().setAuthentication(UsernamePasswordAuthenticationToken.authenticated(
+                new GatewayPrincipal(UUID.randomUUID(), UUID.randomUUID(), Set.of(Permission.CHAT_COMPLETIONS)), null, List.of()));
+        var candidate = new RoutingProperties.Candidate("openai", "another-upstream-model", 0, 1, true);
+        var route = new RoutingProperties.Model(RoutingProperties.Strategy.PRIORITY, true, List.of(candidate));
+        var properties = new RoutingProperties(Map.of("team-chat", route),
+                new RoutingProperties.TenantPolicy(Set.of("team-chat"), Set.of("openai")), null);
+        var config = new OpenAIProperties(true, Map.of("openai-chat", "vendor-model"),
+                Duration.ofSeconds(1), Duration.ofSeconds(2), Duration.ofSeconds(3));
+        var routing = new RoutingService(new ModelRegistry(properties, config, List.of(provider)),
+                List.of(new PriorityRoutingStrategy(), new WeightedRandomRoutingStrategy(bound -> 0)), new SimpleMeterRegistry());
+        var mvc = MockMvcBuilders.standaloneSetup(new ChatCompletionController(new GatewayService(routing)))
+                .setControllerAdvice(new GatewayExceptionHandler()).build();
+        mvc.perform(post("/v1/chat/completions").contentType(MediaType.APPLICATION_JSON)
+                .content(GATEWAY_REQUEST.replace("openai-chat", "team-chat")))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.model").value("team-chat"));
+        assertThat(json.readTree(body.get()).path("model").asText()).isEqualTo("another-upstream-model");
         assertThat(requests.get()).isEqualTo(1);
     }
 
@@ -156,8 +183,13 @@ class OpenAIProviderIT {
         return new OpenAIProvider(client, properties, key, new OpenAIMapper());
     }
     private MockMvc mvc(OpenAIProvider provider) {
-        return MockMvcBuilders.standaloneSetup(new ChatCompletionController(
-                new GatewayService(new ProviderSelector(List.of(provider)))))
+        SecurityContextHolder.getContext().setAuthentication(UsernamePasswordAuthenticationToken.authenticated(
+                new GatewayPrincipal(UUID.randomUUID(), UUID.randomUUID(), Set.of(Permission.CHAT_COMPLETIONS)), null, List.of()));
+        var config = new OpenAIProperties(true, Map.of("openai-chat", "vendor-model"),
+                Duration.ofSeconds(1), Duration.ofSeconds(2), Duration.ofSeconds(3));
+        var routing = new RoutingService(new ModelRegistry(new RoutingProperties(null, null, null), config, List.of(provider)),
+                List.of(new PriorityRoutingStrategy(), new WeightedRandomRoutingStrategy(bound -> 0)), new SimpleMeterRegistry());
+        return MockMvcBuilders.standaloneSetup(new ChatCompletionController(new GatewayService(routing)))
                 .setControllerAdvice(new GatewayExceptionHandler()).build();
     }
     private void assertProblem(OpenAIProvider provider, int expectedStatus, String code) throws Exception {

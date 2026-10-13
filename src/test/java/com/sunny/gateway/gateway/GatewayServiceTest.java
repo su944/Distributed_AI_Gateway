@@ -1,7 +1,8 @@
 package com.sunny.gateway.gateway;
 
 import com.sunny.gateway.provider.*;
-import com.sunny.gateway.routing.ProviderSelector;
+import com.sunny.gateway.routing.*;
+import static org.mockito.Mockito.*;
 import org.junit.jupiter.api.Test;
 import java.util.List;
 import static org.assertj.core.api.Assertions.*;
@@ -15,7 +16,7 @@ class GatewayServiceTest {
             List.of(new ChatMessage("user", "Hello world")), null, 2, null);
 
     @Test void mockHonorsOutputLimitAndUsage() {
-        var service = new GatewayService(new ProviderSelector(List.of(new MockLLMProvider())));
+        var service = service(new MockLLMProvider());
         var response = service.complete(request);
         assertThat(response.choices().getFirst().message().content()).isEqualTo("Mock response:");
         assertThat(response.choices().getFirst().finishReason()).isEqualTo("length");
@@ -31,6 +32,9 @@ class GatewayServiceTest {
 
     @Test void providerFailureIsMappedWithoutLeakingDetails() throws Exception {
         verifyError(new LLMProvider() {
+            public String id() { return "test"; }
+            public boolean supportsUpstream(String model) { return true; }
+            public ChatCompletionResponse complete(ChatCompletionRequest request, String model) { return complete(request); }
             public boolean supports(String model) { return true; }
             public ChatCompletionResponse complete(ChatCompletionRequest request) {
                 throw new ProviderException("upstream-secret-payload");
@@ -40,6 +44,9 @@ class GatewayServiceTest {
 
     @Test void unexpectedFailureIsSanitized() throws Exception {
         verifyError(new LLMProvider() {
+            public String id() { return "test"; }
+            public boolean supportsUpstream(String model) { return true; }
+            public ChatCompletionResponse complete(ChatCompletionRequest request, String model) { return complete(request); }
             public boolean supports(String model) { return true; }
             public ChatCompletionResponse complete(ChatCompletionRequest request) {
                 throw new IllegalStateException("upstream-secret-payload");
@@ -47,8 +54,14 @@ class GatewayServiceTest {
         }, 500, "internal_error");
     }
 
+    private GatewayService service(LLMProvider provider) {
+        var routing = mock(RoutingService.class);
+        when(routing.route(anyString())).thenReturn(new RoutingDecision(provider, "mock-chat", RoutingProperties.Strategy.PRIORITY, "test"));
+        return new GatewayService(routing);
+    }
+
     private void verifyError(LLMProvider provider, int status, String code) throws Exception {
-        var service = new GatewayService(new ProviderSelector(List.of(provider)));
+        var service = service(provider);
         var mvc = MockMvcBuilders.standaloneSetup(new ChatCompletionController(service))
                 .setControllerAdvice(new GatewayExceptionHandler()).build();
         mvc.perform(post("/v1/chat/completions").contentType(MediaType.APPLICATION_JSON).content("""

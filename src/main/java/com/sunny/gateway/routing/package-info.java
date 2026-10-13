@@ -1,4 +1,2 @@
-/**
- * Simple model-based provider selection; advanced routing policies remain planned.
- */
+/** Configurable model registry, tenant policy enforcement and single-attempt provider routing strategies. */
 package com.sunny.gateway.routing;

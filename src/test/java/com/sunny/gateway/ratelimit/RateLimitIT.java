@@ -54,6 +54,7 @@ class RateLimitIT extends PostgresIntegrationSupport {
         assertThat(denied.getHeaders().getFirst("X-RateLimit-Remaining")).isEqualTo("0");
         assertThat(denied.getBody()).contains("rate_limit_exceeded");
         verify(provider, never()).complete(any());
+        verify(provider, never()).complete(any(), anyString());
     }
     @Test void invalidAndUnpermittedKeysCannotConsumeTokens() {
         assertThat(chat(client, "invalid").getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);

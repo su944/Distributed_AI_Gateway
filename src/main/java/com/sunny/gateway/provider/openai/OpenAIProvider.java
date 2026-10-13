@@ -25,12 +25,19 @@ public class OpenAIProvider implements LLMProvider {
         this.mapper = mapper;
     }
 
+    @Override public String id() { return "openai"; }
+    @Override public boolean supportsUpstream(String model) {
+        return model != null && model.matches("[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}");
+    }
     @Override public boolean supports(String model) { return properties.models().containsKey(model); }
 
     @Override public ChatCompletionResponse complete(ChatCompletionRequest request) {
+        return complete(request, properties.models().get(request.model()));
+    }
+
+    @Override public ChatCompletionResponse complete(ChatCompletionRequest request, String model) {
         if (apiKey == null || apiKey.isBlank()) throw new ProviderException(MISSING_CREDENTIALS);
-        String model = properties.models().get(request.model());
-        if (model == null) throw new ProviderException(ERROR);
+        if (!supportsUpstream(model)) throw new ProviderException(ERROR);
         try {
             return client.post().uri("/v1/chat/completions")
                     .headers(headers -> headers.setBearerAuth(apiKey))

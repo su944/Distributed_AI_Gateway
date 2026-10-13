@@ -11,6 +11,12 @@ import java.util.UUID;
 @Component
 @ConditionalOnProperty(name = "gateway.mock.enabled", havingValue = "true", matchIfMissing = true)
 public class MockLLMProvider implements LLMProvider {
+    @Override public String id() { return "mock"; }
+    @Override public boolean supportsUpstream(String model) { return "mock-chat".equals(model); }
+    @Override public ChatCompletionResponse complete(ChatCompletionRequest request, String upstreamModel) {
+        if (!supportsUpstream(upstreamModel)) throw new ProviderException(ProviderException.Reason.ERROR);
+        return complete(request);
+    }
     @Override public boolean supports(String model) { return "mock-chat".equals(model); }
 
     @Override public ChatCompletionResponse complete(ChatCompletionRequest request) {

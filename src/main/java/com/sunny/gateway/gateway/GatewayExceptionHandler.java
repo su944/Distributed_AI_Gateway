@@ -13,6 +13,7 @@ public class GatewayExceptionHandler extends ResponseEntityExceptionHandler {
     @ExceptionHandler(GatewayException.class)
     ProblemDetail gatewayError(GatewayException exception) {
         return switch (exception.reason()) {
+            case MODEL_FORBIDDEN -> problem(HttpStatus.FORBIDDEN, "model_forbidden", "Access to the requested model is denied.");
             case UNSUPPORTED_MODEL -> problem(HttpStatus.BAD_REQUEST, "unsupported_model", "The requested model is not supported.");
             case PROVIDER_UNAVAILABLE -> problem(HttpStatus.SERVICE_UNAVAILABLE, "provider_unavailable", "The requested provider is disabled or unavailable.");
         };
